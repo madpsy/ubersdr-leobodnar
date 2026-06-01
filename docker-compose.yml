@@ -1,0 +1,11 @@
+services:
+  leobodnar:
+    image: madpsy/ubersdr-leobodnar:latest
+    container_name: ubersdr-leobodnar
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /dev:/dev
+    ports:
+      - "5123:5123"
+    command: ["--serve"]
