@@ -1081,15 +1081,15 @@ static void serve_http(int port, int readonly)
     }
 
     /* Embedded HTML dashboard template.
-     * snprintf substitutions (in order):
+     * snprintf substitutions (7 total, in order):
      *   %s  → "true" or "false"  (READONLY JS variable)
-     *   %s  → prefix             (X-Forwarded-Prefix, e.g. "/gpsdo" or "")
      *   %s  → prefix             (/config/output1)
      *   %s  → prefix             (/config/frequency — setFreqVal)
      *   %s  → prefix             (/config/frequency — setFreq)
      *   %s  → prefix             (/config/power1)
      *   %s  → prefix             (/config/blink)
      *   %s  → prefix             (/events EventSource)
+     * prefix comes from X-Forwarded-Prefix header (e.g. "/gpsdo"), default "".
      */
     static const char html_template[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
