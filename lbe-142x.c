@@ -1405,10 +1405,25 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
 
 int main(int argc, char **argv)
 {
-      /* Quick pre-scan for --json / -j and --serve before any output */
+      /* Quick pre-scan for --json / -j and --serve before any output.
+       * Environment variables are checked first so CLI args can override. */
       int json_mode = 0;
       int serve_mode = 0;
       int serve_port = HTTP_DEFAULT_PORT;
+
+      /* Env var pre-population (lowest priority — CLI args override below) */
+      {
+          const char *ev;
+          if ((ev = getenv("LBE_SERVE")) != NULL && atoi(ev)) {
+              serve_mode = 1;
+              json_mode  = 1;
+          }
+          if ((ev = getenv("LBE_JSON")) != NULL && atoi(ev))
+              json_mode = 1;
+          if ((ev = getenv("LBE_PORT")) != NULL && atoi(ev) > 0)
+              serve_port = atoi(ev);
+      }
+
       for (int i = 1; i < argc; i++) {
           if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0) {
               json_mode = 1;
@@ -1437,9 +1452,14 @@ int main(int argc, char **argv)
       const char *hidraw_path = NULL;
       const char *auto_serial = NULL;
 
-      /* Check if first non-option arg looks like a device path */
+      /* Check if first non-option arg looks like a device path,
+       * or fall back to LBE_HIDRAW environment variable. */
+      const char *env_hidraw = getenv("LBE_HIDRAW");
       if (argc >= 2 && argv[1][0] == '/') {
           hidraw_path = argv[1];
+      } else if (env_hidraw && env_hidraw[0] == '/') {
+          strncpy(hidraw_path_buf, env_hidraw, sizeof(hidraw_path_buf) - 1);
+          hidraw_path = hidraw_path_buf;
       } else {
           /* Auto-discover */
           LbeDevice devs[MAX_DEVICES];
@@ -1601,6 +1621,27 @@ int main(int argc, char **argv)
  int serve_unused = 0, port_unused = 0; /* already captured in pre-scan */
  char *serial_port = NULL;
  processCommandLineArguments(argc, argv, &new_f, &blink, &enable, &save, &serial_port, &json_out_unused, &serve_unused, &port_unused);
+
+ /* Apply environment variable fallbacks for any option not set by CLI args.
+  * CLI args always take priority over env vars. */
+ {
+     const char *ev;
+     if (!serial_port && (ev = getenv("LBE_SERIAL")) != NULL && ev[0])
+         serial_port = (char *)ev;
+     if (new_f == (int)0xffffffff) {
+         if ((ev = getenv("LBE_F1")) != NULL && atoi(ev) > 0) {
+             new_f = atoi(ev);
+             save  = 1;
+         } else if ((ev = getenv("LBE_F1_NOSAVE")) != NULL && atoi(ev) > 0) {
+             new_f = atoi(ev);
+             save  = 0;
+         }
+     }
+     if (enable == -1 && (ev = getenv("LBE_OUT1")) != NULL)
+         enable = atoi(ev);
+     if (blink == -1 && (ev = getenv("LBE_BLINK1")) != NULL && atoi(ev))
+         blink = 1;
+ }
 
  /* Fall back to auto-detected serial port if --serial not given */
  if (!serial_port && auto_serial)

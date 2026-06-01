@@ -8,4 +8,24 @@ services:
       - /dev:/dev
     ports:
       - "5123:5123"
-    command: ["--serve"]
+    environment:
+      # All CLI options can be set via environment variables.
+      # CLI arguments always take priority over env vars.
+      #
+      # LBE_HIDRAW   - HID raw device path, e.g. /dev/hidraw0
+      #                (auto-discovered if not set)
+      # LBE_SERIAL   - Serial port for NMEA GPS data, e.g. /dev/ttyACM0
+      #                (auto-discovered if not set)
+      # LBE_SERVE    - Set to 1 to start the web server (default mode in Docker)
+      # LBE_PORT     - HTTP server port (default: 5123)
+      # LBE_JSON     - Set to 1 to enable JSON output mode
+      # LBE_F1       - Output 1 frequency in Hz, saved to flash (e.g. 27000000)
+      # LBE_F1_NOSAVE - Output 1 frequency in Hz, NOT saved to flash
+      # LBE_OUT1     - Enable/disable output 1: 1=enable, 0=disable
+      # LBE_BLINK1   - Set to 1 to blink output 1 LED for 3 seconds
+      LBE_SERVE: "1"
+      LBE_PORT: "5123"
+      # LBE_HIDRAW: /dev/hidraw0
+      # LBE_SERIAL: /dev/ttyACM0
+      # LBE_F1: "27000000"
+      # LBE_OUT1: "1"
