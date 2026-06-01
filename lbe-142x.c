@@ -562,15 +562,20 @@ wait_for_port:
     }
 
 retry:;
+    /* Always re-read the current port from shared state before opening.
+     * The monitor thread may have updated it (e.g. ttyACM0 → ttyACM1)
+     * while we were looping on a dead fd. */
+    {
+        pthread_mutex_lock(&st->lock);
+        strncpy(cur_port, st->serial_port, sizeof(cur_port) - 1);
+        st->serial_changed = 0;
+        pthread_mutex_unlock(&st->lock);
+    }
+    if (!cur_port[0]) goto wait_for_port;
+
     int sfd = open(cur_port, O_RDONLY | O_NOCTTY | O_NONBLOCK);
     if (sfd < 0) {
         sleep(2);
-        pthread_mutex_lock(&st->lock);
-        int chg = st->serial_changed;
-        if (chg) strncpy(cur_port, st->serial_port, sizeof(cur_port) - 1);
-        st->serial_changed = 0;
-        pthread_mutex_unlock(&st->lock);
-        if (chg) goto wait_for_port;
         goto retry;
     }
 
@@ -596,16 +601,30 @@ retry:;
     int  linelen = 0;
 
     while (1) {
+        /* Check if monitor has signalled a port change before blocking */
+        pthread_mutex_lock(&st->lock);
+        int chg = st->serial_changed;
+        pthread_mutex_unlock(&st->lock);
+        if (chg) { close(sfd); goto retry; }
+
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(sfd, &rfds);
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         int sel = select(sfd + 1, &rfds, NULL, NULL, &tv);
-        if (sel < 0) break;   /* fd gone — reopen */
-        if (sel == 0) continue;
+        if (sel < 0) break;   /* fd error — reopen */
+        if (sel == 0) {
+            /* Timeout: check for port change (device unplugged/replugged) */
+            pthread_mutex_lock(&st->lock);
+            chg = st->serial_changed;
+            pthread_mutex_unlock(&st->lock);
+            if (chg) { close(sfd); goto retry; }
+            continue;
+        }
 
         char ch;
-        while (read(sfd, &ch, 1) == 1) {
+        ssize_t n;
+        while ((n = read(sfd, &ch, 1)) == 1) {
             if (ch == '\r') continue;
             if (ch == '\n') {
                 linebuf[linelen] = '\0';
@@ -698,6 +717,11 @@ retry:;
                     linebuf[linelen++] = ch;
             }
         }
+        /* read() returned 0 (EOF) or an error other than EAGAIN/EWOULDBLOCK.
+         * EOF means the USB serial device was cleanly removed; EIO means it
+         * was yanked mid-read.  Either way, close and reopen. */
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+            break;
     }
 
     close(sfd);
@@ -1190,6 +1214,12 @@ static void serve_http(int port, int readonly)
 "  var e=document.getElementById(id);"
 "  if(e){e.textContent=val;if(cls)e.className='val '+cls;else e.className='val';}"
 "}"
+/* Fix Leaflet default marker icon paths broken when loaded from CDN */
+"var _iconBase='https://unpkg.com/leaflet@1.9.4/dist/images/';"
+"L.Icon.Default.prototype.options.iconUrl=_iconBase+'marker-icon.png';"
+"L.Icon.Default.prototype.options.iconRetinaUrl=_iconBase+'marker-icon-2x.png';"
+"L.Icon.Default.prototype.options.shadowUrl=_iconBase+'marker-shadow.png';"
+"L.Icon.Default.imagePath='';"
 "function initMap(lat,lng){"
 "  var el=document.getElementById('map');"
 "  el.style.display='block';"
