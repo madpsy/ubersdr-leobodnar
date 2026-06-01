@@ -102,6 +102,122 @@ sudo ./lbe-142x --serve --serial /dev/ttyACM0
 sudo ./lbe-142x --serve --port 8080 --serial /dev/ttyACM0
 ```
 
+## Environment Variables
+
+Every CLI option can also be set via an environment variable. CLI arguments always
+take priority over environment variables.
+
+| Variable | Equivalent option | Description |
+|----------|-------------------|-------------|
+| `LBE_HIDRAW` | `/dev/hidrawN` (positional) | HID raw device path. Auto-discovered if not set. |
+| `LBE_SERIAL` | `--serial` | Serial port for NMEA GPS data. Auto-discovered if not set. |
+| `LBE_SERVE` | `--serve` | Set to `1` to start the web server. |
+| `LBE_PORT` | `--port` | HTTP server port (default: `5123`). |
+| `LBE_JSON` | `--json` | Set to `1` to enable JSON output mode. |
+| `LBE_F1` | `--f1` | Output frequency in Hz, saved to flash. |
+| `LBE_F1_NOSAVE` | `--f1_nosave` | Output frequency in Hz, **not** saved to flash. |
+| `LBE_OUT1` | `--out1` | `1` to enable output 1, `0` to disable. |
+| `LBE_BLINK1` | `--blink1` | Set to `1` to blink the output 1 LED. |
+
+```bash
+# Example: start the web server via env vars
+LBE_SERVE=1 LBE_PORT=5123 LBE_SERIAL=/dev/ttyACM0 ./lbe-142x
+```
+
+## Docker
+
+Pre-built multi-arch images (linux/amd64 and linux/arm64) are available on Docker Hub:
+
+```
+docker pull madpsy/ubersdr-leobodnar:latest
+```
+
+The container requires `--privileged` and `/dev` access to reach the USB HID device.
+
+### docker-compose (recommended)
+
+```bash
+docker compose up -d
+```
+
+The included [`docker-compose.yml`](docker-compose.yml) starts the web server on port
+5123 with full device access. Edit the `environment:` section to override any option:
+
+```yaml
+environment:
+  LBE_SERVE: "1"
+  LBE_PORT: "5123"
+  # LBE_HIDRAW: /dev/hidraw0
+  # LBE_SERIAL: /dev/ttyACM0
+  # LBE_F1: "27000000"
+  # LBE_OUT1: "1"
+```
+
+### docker run
+
+```bash
+docker run -d \
+  --privileged \
+  --volume /dev:/dev \
+  --publish 5123:5123 \
+  --env LBE_SERVE=1 \
+  --env LBE_SERIAL=/dev/ttyACM0 \
+  madpsy/ubersdr-leobodnar:latest
+```
+
+### Running via docker.sh
+
+[`docker.sh`](docker.sh) is a convenience wrapper around `docker buildx` and `docker run`.
+
+```bash
+# Run the image locally (serves on port 5123, requires /dev access)
+./docker.sh run
+
+# Pass extra arguments directly to lbe-142x
+./docker.sh run --serial /dev/ttyACM0
+```
+
+### Building the image
+
+```bash
+# Build for linux/amd64 (local)
+./docker.sh build
+
+# Build for linux/arm64 (local)
+./docker.sh arm64
+
+# Build and push multi-arch manifest to Docker Hub
+./docker.sh push
+```
+
+`docker.sh push` also runs `git commit && git push` to keep the repository in sync.
+
+A `multiarch` buildx builder is created automatically on first use:
+
+```bash
+docker buildx create --name multiarch --driver docker-container --use
+```
+
+The following environment variables control the build scripts:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IMAGE` | `madpsy/ubersdr-leobodnar:latest` | Docker image name and tag |
+| `PLATFORM` | `linux/amd64` | Target `--platform` for single-arch builds |
+| `BUILDER` | `multiarch` | Name of the `docker buildx` builder to use |
+
+```bash
+# Example: build for arm64 with a custom tag
+IMAGE=myrepo/lbe-142x:dev PLATFORM=linux/arm64 ./docker.sh build
+```
+
+### Default container behaviour
+
+The [`Dockerfile`](Dockerfile) sets `CMD ["--serve"]`, so the container starts the web
+server on port 5123 by default. Any arguments passed to `docker run` (or the `command:`
+key in `docker-compose.yml`) replace this default and are forwarded directly to
+`lbe-142x`.
+
 ## Web Server (`--serve`)
 
 When started with `--serve`, the binary listens on TCP port 5123 (or `--port N`)
