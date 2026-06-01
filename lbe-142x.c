@@ -486,6 +486,11 @@ static int find_lbe_devices(LbeDevice *devs, int maxdevs)
  * ----------------------------------------------------------------------- */
 #define HTTP_DEFAULT_PORT 5123
 
+/* Global read-only flag — set once at startup, never modified afterwards.
+ * When non-zero, all HID config writes and HTTP POST /config/* endpoints
+ * are blocked. */
+static int g_readonly = 0;
+
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  new_data;  /* broadcast by NMEA thread on each $GNGGA */
@@ -967,7 +972,64 @@ static void *sse_client_thread(void *arg)
 }
 
 /* ---- HTTP listener: GET / → JSON snapshot, GET /events → SSE stream -- */
-static void serve_http(int port)
+/* ---- Heartbeat thread: polls HID and broadcasts every 5s regardless of NMEA.
+ * This ensures SSE clients receive device status updates even when no GPS
+ * signal is present and no NMEA sentences are flowing. */
+static void *heartbeat_thread(void *arg)
+{
+    ServerState *st = (ServerState *)arg;
+    while (1) {
+        sleep(5);
+
+        /* Snapshot HID path under lock */
+        char hid_snap[64] = {0};
+        pthread_mutex_lock(&st->lock);
+        strncpy(hid_snap, st->hidraw_path, sizeof(hid_snap) - 1);
+        pthread_mutex_unlock(&st->lock);
+
+        /* Read HID outside the lock */
+        uint8_t  h_status = 0, h_fll = 0, h_out1low = 0;
+        uint32_t h_freq   = 0;
+        int      h_valid  = 0;
+        if (hid_snap[0]) {
+            int hfd = open(hid_snap, O_RDWR | O_NONBLOCK);
+            if (hfd >= 0) {
+                u_int8_t hbuf[60];
+                hbuf[0] = 0x1;
+                int hres = ioctl(hfd, HIDIOCGFEATURE(256), hbuf);
+                if (hres >= 0 && hbuf[0] == 0x01) {
+                    h_status  = hbuf[1];
+                    h_fll     = hbuf[18];
+                    h_out1low = hbuf[10];
+                    h_freq    = ((uint32_t)hbuf[9] << 24) |
+                                ((uint32_t)hbuf[8] << 16) |
+                                ((uint32_t)hbuf[7] <<  8) |
+                                 (uint32_t)hbuf[6];
+                    h_valid   = 1;
+                }
+                close(hfd);
+            }
+        }
+
+        /* Store results and broadcast to SSE clients */
+        pthread_mutex_lock(&st->lock);
+        if (h_valid) {
+            st->hid_status   = h_status;
+            st->hid_fll      = h_fll;
+            st->hid_out1low  = h_out1low;
+            st->frequency_hz = h_freq;
+            st->hid_valid    = h_valid;
+        } else if (hid_snap[0]) {
+            /* Device was present but read failed — mark invalid */
+            st->hid_valid = 0;
+        }
+        pthread_cond_broadcast(&st->new_data);
+        pthread_mutex_unlock(&st->lock);
+    }
+    return NULL;
+}
+
+static void serve_http(int port, int readonly)
 {
     /* Ignore SIGPIPE so writes to closed sockets return -1 instead of
      * killing the process (affects SSE client threads). */
@@ -980,9 +1042,10 @@ static void serve_http(int port)
     pthread_cond_init(&st.new_data, NULL);
 
     /* Start background threads */
-    pthread_t monitor_tid, nmea_tid;
-    pthread_create(&monitor_tid, NULL, device_monitor_thread, &st);
-    pthread_create(&nmea_tid,    NULL, nmea_stream_thread,    &st);
+    pthread_t monitor_tid, nmea_tid, heartbeat_tid;
+    pthread_create(&monitor_tid,   NULL, device_monitor_thread, &st);
+    pthread_create(&nmea_tid,      NULL, nmea_stream_thread,    &st);
+    pthread_create(&heartbeat_tid, NULL, heartbeat_thread,      &st);
 
     /* TCP listener */
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -1003,17 +1066,24 @@ static void serve_http(int port)
         perror("listen"); close(srv); return;
     }
 
-    fprintf(stderr, "Serving on http://0.0.0.0:%d/\n", port);
+    fprintf(stderr, "Serving on http://0.0.0.0:%d/%s\n", port,
+            readonly ? "  [READ-ONLY mode]" : "");
     fprintf(stderr, "  GET  /                   -> HTML dashboard\n");
     fprintf(stderr, "  GET  /json               -> JSON snapshot\n");
     fprintf(stderr, "  GET  /events             -> SSE stream\n");
-    fprintf(stderr, "  POST /config/frequency   -> {\"frequency_hz\":N[,\"save\":true]}\n");
-    fprintf(stderr, "  POST /config/output1     -> {\"enabled\":true|false}\n");
-    fprintf(stderr, "  POST /config/power1      -> {\"low\":true|false}\n");
-    fprintf(stderr, "  POST /config/blink       -> {}\n");
+    if (!readonly) {
+        fprintf(stderr, "  POST /config/frequency   -> {\"frequency_hz\":N[,\"save\":true]}\n");
+        fprintf(stderr, "  POST /config/output1     -> {\"enabled\":true|false}\n");
+        fprintf(stderr, "  POST /config/power1      -> {\"low\":true|false}\n");
+        fprintf(stderr, "  POST /config/blink       -> {}\n");
+    } else {
+        fprintf(stderr, "  POST /config/*           -> 403 Forbidden (read-only mode)\n");
+    }
 
-    /* Embedded HTML dashboard */
-    static const char html_body[] =
+    /* Embedded HTML dashboard.
+     * The readonly flag is injected as a JS variable so the controls card
+     * can be hidden at runtime without duplicating the entire HTML string. */
+    static const char html_head[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 "<title>Leo Bodnar LBE-1420</title>"
@@ -1036,8 +1106,10 @@ static void serve_http(int port)
 "button{background:#111;color:#0f0;border:1px solid #0f0;padding:.25em .8em;font-family:monospace;cursor:pointer}"
 "button:hover{background:#0f0;color:#111}"
 "#ctrl_status{color:#888;font-size:.8em;margin-top:.4em}"
+"#readonly_banner{color:#ff0;font-size:.8em;margin-bottom:.5em;display:none}"
 "</style></head><body>"
 "<h1>&#x1F4E1; Leo Bodnar LBE-1420</h1>"
+"<div id=\"readonly_banner\">&#x1F512; Read-only mode &mdash; configuration changes are disabled</div>"
 "<div id=\"status\">Connecting...</div>"
 "<div class=\"card\">"
 "  <div class=\"label\">Device</div>"
@@ -1098,7 +1170,13 @@ static void serve_http(int port)
 "  </div>"
 "  <div id=\"ctrl_status\"></div>"
 "</div>"
-"<script>"
+"<script>";
+
+    /* html_page_tail: JS body + closing tags.
+     * The HTTP handler injects "var READONLY=true/false;\n" between
+     * html_page_top and html_page_tail so READONLY is the first JS
+     * statement and is visible to all code that follows. */
+    static const char html_page_tail[] =
 "var evtCount=0,map=null,marker=null;"
 "function fmtFreq(hz){"
 "  if(hz>=1e6) return (hz/1e6).toFixed(6)+' MHz';"
@@ -1224,6 +1302,10 @@ static void serve_http(int port)
 "    document.getElementById('status').textContent='JSON parse error: '+ex.message;"
 "  }"
 "};"
+"if(READONLY){"
+"  document.getElementById('ctrl_card').style.display='none';"
+"  document.getElementById('readonly_banner').style.display='block';"
+"}"
 "</script></body></html>\n";
 
     while (1) {
@@ -1315,6 +1397,24 @@ static void serve_http(int port)
         } else if (is_post_freq || is_post_out1 || is_post_pwr1 || is_post_blink) {
             /* --- Config POST endpoints ---------------------------------- */
 
+            /* Reject writes in read-only mode */
+            if (readonly) {
+                static const char ro_body[] = "{\"ok\":false,\"error\":\"read-only mode\"}\n";
+                char ro_hdr[256];
+                int rhl = snprintf(ro_hdr, sizeof(ro_hdr),
+                    "HTTP/1.1 403 Forbidden\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    sizeof(ro_body) - 1);
+                write(cfd, ro_hdr, rhl);
+                write(cfd, ro_body, sizeof(ro_body) - 1);
+                close(cfd);
+                continue;
+            }
+
             /* Extract body: find \r\n\r\n separator */
             const char *body_start = strstr(req, "\r\n\r\n");
             if (body_start) body_start += 4;
@@ -1383,8 +1483,14 @@ static void serve_http(int port)
             close(cfd);
 
         } else {
-            /* HTML dashboard */
-            size_t html_len = sizeof(html_body) - 1;
+            /* HTML dashboard — inject READONLY JS variable between head and tail.
+             * Structure: html_head (<script> open) | ro_inject (var READONLY=...) | html_page_tail (JS body + </script></body></html>) */
+            char ro_inject[64];
+            int ro_len = snprintf(ro_inject, sizeof(ro_inject),
+                                  "var READONLY=%s;\n", readonly ? "true" : "false");
+            size_t head_len  = sizeof(html_head) - 1;
+            size_t tail_len  = sizeof(html_page_tail) - 1;
+            size_t total_len = head_len + (size_t)ro_len + tail_len;
             char header[128];
             int hlen = snprintf(header, sizeof(header),
                 "HTTP/1.1 200 OK\r\n"
@@ -1392,24 +1498,27 @@ static void serve_http(int port)
                 "Content-Length: %zu\r\n"
                 "Connection: close\r\n"
                 "\r\n",
-                html_len);
+                total_len);
             write(cfd, header, hlen);
-            write(cfd, html_body, html_len);
+            write(cfd, html_head, head_len);
+            write(cfd, ro_inject, ro_len);
+            write(cfd, html_page_tail, tail_len);
             close(cfd);
         }
     }
     close(srv);
 }
 
-int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port);
+int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port, int *readonly);
 
 int main(int argc, char **argv)
 {
-      /* Quick pre-scan for --json / -j and --serve before any output.
+      /* Quick pre-scan for --json / -j, --serve, --readonly before any output.
        * Environment variables are checked first so CLI args can override. */
       int json_mode = 0;
       int serve_mode = 0;
       int serve_port = HTTP_DEFAULT_PORT;
+      int readonly_mode = 0;
 
       /* Env var pre-population (lowest priority — CLI args override below) */
       {
@@ -1422,6 +1531,8 @@ int main(int argc, char **argv)
               json_mode = 1;
           if ((ev = getenv("LBE_PORT")) != NULL && atoi(ev) > 0)
               serve_port = atoi(ev);
+          if ((ev = getenv("LBE_READONLY")) != NULL && atoi(ev))
+              readonly_mode = 1;
       }
 
       for (int i = 1; i < argc; i++) {
@@ -1432,8 +1543,13 @@ int main(int argc, char **argv)
               json_mode  = 1;   /* serve mode implies JSON */
           } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
               serve_port = atoi(argv[++i]);
+          } else if (strcmp(argv[i], "--readonly") == 0) {
+              readonly_mode = 1;
           }
       }
+
+      /* Propagate to global so serve_http() can read it */
+      g_readonly = readonly_mode;
 
       if (!json_mode)
           printf("Leo Bodnar LBE-142x GPS locked clock source config\n\n");
@@ -1532,7 +1648,7 @@ int main(int argc, char **argv)
       /* In serve mode with no device present, skip straight to the server.
        * The monitor thread inside serve_http() will open the device later. */
       if (serve_mode && !hidraw_path) {
-          serve_http(serve_port);
+          serve_http(serve_port, readonly_mode);
           return 0;
       }
 
@@ -1619,8 +1735,9 @@ int main(int argc, char **argv)
  int new_f = 0xffffffff;
  int json_out_unused = 0; /* already captured in json_mode */
  int serve_unused = 0, port_unused = 0; /* already captured in pre-scan */
+ int readonly_unused = 0; /* already captured in readonly_mode */
  char *serial_port = NULL;
- processCommandLineArguments(argc, argv, &new_f, &blink, &enable, &save, &serial_port, &json_out_unused, &serve_unused, &port_unused);
+ processCommandLineArguments(argc, argv, &new_f, &blink, &enable, &save, &serial_port, &json_out_unused, &serve_unused, &port_unused, &readonly_unused);
 
  /* Apply environment variable fallbacks for any option not set by CLI args.
   * CLI args always take priority over env vars. */
@@ -1778,7 +1895,10 @@ int main(int argc, char **argv)
  if (!json_mode) {
      printf("  Changes:\n");
  }
-      	int changed = 0;
+       	int changed = 0;
+ if (readonly_mode) {
+     if (!json_mode) printf("    Read-only mode — no changes applied\n");
+ } else {
  if (new_f != 0xffffffff && new_f != current_f) {
      if (!json_mode) printf("    Setting Frequency: %d Hz\n", new_f);
 
@@ -1812,10 +1932,11 @@ int main(int argc, char **argv)
  if (!changed && !json_mode) {
      printf("    No changes made\n");
  }
+ } /* end !readonly_mode */
 
  /* Start web server if requested (blocks forever) */
  if (serve_mode) {
-     serve_http(serve_port);
+     serve_http(serve_port, readonly_mode);
  }
       }
       close(fd);
@@ -1824,7 +1945,7 @@ int main(int argc, char **argv)
 }
 
 
-int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port)
+int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port, int *readonly)
 {
     int c;
     
@@ -1843,12 +1964,13 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
                 {"json",      no_argument,       0, 'j'},
                 {"serve",     no_argument,       0, 'S'},
                 {"port",      required_argument, 0, 'P'},
+                {"readonly",  no_argument,       0, 'R'},
                 {0, 0, 0, 0}
         };
         /* getopt_long stores the option index here. */
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "abc:s:jSP:",
+        c = getopt_long(argc, argv, "abc:s:jSP:R",
                     long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -1892,6 +2014,10 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
 
             case 'P'://port
                 *port = atoi(optarg);
+                break;
+
+            case 'R'://readonly
+                *readonly = 1;
                 break;
 
             case '?':

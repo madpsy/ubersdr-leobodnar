@@ -73,6 +73,7 @@ If multiple devices are present you will be prompted to choose.
 | `--json` | — | Output a single JSON snapshot to stdout and exit. |
 | `--serve` | — | Start the HTTP web server (default port 5123). Blocks forever. |
 | `--port` | `<N>` | HTTP port for `--serve` mode (default: 5123). |
+| `--readonly` | — | Read-only mode. Disables all config writes (HID feature reports). In `--serve` mode, HTTP `POST /config/*` endpoints return `403 Forbidden` and the controls card is hidden in the dashboard. Default: off (writes allowed). |
 
 ### Examples
 
@@ -118,6 +119,7 @@ take priority over environment variables.
 | `LBE_F1_NOSAVE` | `--f1_nosave` | Output frequency in Hz, **not** saved to flash. |
 | `LBE_OUT1` | `--out1` | `1` to enable output 1, `0` to disable. |
 | `LBE_BLINK1` | `--blink1` | Set to `1` to blink the output 1 LED. |
+| `LBE_READONLY` | `--readonly` | Set to `1` to enable read-only mode (no config writes). |
 
 ```bash
 # Example: start the web server via env vars
