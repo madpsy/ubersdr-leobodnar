@@ -1080,10 +1080,18 @@ static void serve_http(int port, int readonly)
         fprintf(stderr, "  POST /config/*           -> 403 Forbidden (read-only mode)\n");
     }
 
-    /* Embedded HTML dashboard.
-     * The readonly flag is injected as a JS variable so the controls card
-     * can be hidden at runtime without duplicating the entire HTML string. */
-    static const char html_head[] =
+    /* Embedded HTML dashboard template.
+     * snprintf substitutions (in order):
+     *   %s  → "true" or "false"  (READONLY JS variable)
+     *   %s  → prefix             (X-Forwarded-Prefix, e.g. "/gpsdo" or "")
+     *   %s  → prefix             (/config/output1)
+     *   %s  → prefix             (/config/frequency — setFreqVal)
+     *   %s  → prefix             (/config/frequency — setFreq)
+     *   %s  → prefix             (/config/power1)
+     *   %s  → prefix             (/config/blink)
+     *   %s  → prefix             (/events EventSource)
+     */
+    static const char html_template[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 "<title>Leo Bodnar LBE-1420</title>"
@@ -1170,13 +1178,8 @@ static void serve_http(int port, int readonly)
 "  </div>"
 "  <div id=\"ctrl_status\"></div>"
 "</div>"
-"<script>";
-
-    /* html_page_tail: JS body + closing tags.
-     * The HTTP handler injects "var READONLY=true/false;\n" between
-     * html_page_top and html_page_tail so READONLY is the first JS
-     * statement and is visible to all code that follows. */
-    static const char html_page_tail[] =
+"<script>"
+"var READONLY=%s;"  /* substituted: "true" or "false" */
 "var evtCount=0,map=null,marker=null;"
 "function fmtFreq(hz){"
 "  if(hz>=1e6) return (hz/1e6).toFixed(6)+' MHz';"
@@ -1273,26 +1276,26 @@ static void serve_http(int port, int readonly)
 "}"
 "function setOutput1(enabled){"
 "  document.getElementById('ctrl_out1_lbl').textContent=enabled?'enabled':'disabled';"
-"  apiPost('/config/output1',{enabled:enabled});"
+"  apiPost('%s/config/output1',{enabled:enabled});"  /* PREFIX */
 "}"
 "function setFreqVal(hz){"
 "  document.getElementById('ctrl_freq').value=hz;"
 "  var save=document.getElementById('ctrl_save').checked;"
-"  apiPost('/config/frequency',{frequency_hz:hz,save:save});"
+"  apiPost('%s/config/frequency',{frequency_hz:hz,save:save});"  /* PREFIX */
 "}"
 "function setFreq(){"
 "  var hz=parseInt(document.getElementById('ctrl_freq').value,10);"
 "  if(!hz||hz<1){document.getElementById('ctrl_status').textContent='Enter a valid frequency in Hz';return;}"
 "  var save=document.getElementById('ctrl_save').checked;"
-"  apiPost('/config/frequency',{frequency_hz:hz,save:save});"
+"  apiPost('%s/config/frequency',{frequency_hz:hz,save:save});"  /* PREFIX */
 "}"
 "function setPower1(low){"
-"  apiPost('/config/power1',{low:low});"
+"  apiPost('%s/config/power1',{low:low});"  /* PREFIX */
 "}"
 "function doBlink(){"
-"  apiPost('/config/blink',{});"
+"  apiPost('%s/config/blink',{});"  /* PREFIX */
 "}"
-"var es=new EventSource('/events');"
+"var es=new EventSource('%s/events');"  /* PREFIX */
 "es.onopen=function(){document.getElementById('status').textContent='Connected - live updates via SSE';};"
 "es.onerror=function(){document.getElementById('status').textContent='SSE disconnected - retrying...';};"
 "es.onmessage=function(e){"
@@ -1483,26 +1486,46 @@ static void serve_http(int port, int readonly)
             close(cfd);
 
         } else {
-            /* HTML dashboard — inject READONLY JS variable between head and tail.
-             * Structure: html_head (<script> open) | ro_inject (var READONLY=...) | html_page_tail (JS body + </script></body></html>) */
-            char ro_inject[64];
-            int ro_len = snprintf(ro_inject, sizeof(ro_inject),
-                                  "var READONLY=%s;\n", readonly ? "true" : "false");
-            size_t head_len  = sizeof(html_head) - 1;
-            size_t tail_len  = sizeof(html_page_tail) - 1;
-            size_t total_len = head_len + (size_t)ro_len + tail_len;
+            /* HTML dashboard — substitute READONLY and PREFIX into the template.
+             * PREFIX comes from the X-Forwarded-Prefix request header (set by a
+             * reverse proxy such as UberSDR's /gpsdo/ route).  When accessed
+             * directly the header is absent and prefix defaults to "", so all
+             * paths remain absolute (e.g. /events, /config/output1). */
+            char prefix[128] = "";
+            const char *pfx_hdr = strcasestr(req, "X-Forwarded-Prefix:");
+            if (pfx_hdr) {
+                pfx_hdr += 19; /* skip "X-Forwarded-Prefix:" */
+                while (*pfx_hdr == ' ') pfx_hdr++;
+                const char *pfx_end = strpbrk(pfx_hdr, "\r\n");
+                size_t pfx_len = pfx_end ? (size_t)(pfx_end - pfx_hdr) : strlen(pfx_hdr);
+                if (pfx_len > 0 && pfx_len < sizeof(prefix))
+                    memcpy(prefix, pfx_hdr, pfx_len);
+            }
+
+            /* Compute body length first (snprintf returns the would-be length) */
+            const char *ro_str = readonly ? "true" : "false";
+            int body_len = snprintf(NULL, 0, html_template,
+                ro_str,
+                prefix, prefix, prefix, prefix, prefix, prefix);
+            if (body_len < 0) { close(cfd); continue; }
+
+            char *body = malloc((size_t)body_len + 1);
+            if (!body) { close(cfd); continue; }
+            snprintf(body, (size_t)body_len + 1, html_template,
+                ro_str,
+                prefix, prefix, prefix, prefix, prefix, prefix);
+
             char header[128];
             int hlen = snprintf(header, sizeof(header),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
+                "Content-Length: %d\r\n"
                 "Connection: close\r\n"
                 "\r\n",
-                total_len);
+                body_len);
             write(cfd, header, hlen);
-            write(cfd, html_head, head_len);
-            write(cfd, ro_inject, ro_len);
-            write(cfd, html_page_tail, tail_len);
+            write(cfd, body, (size_t)body_len);
+            free(body);
             close(cfd);
         }
     }
