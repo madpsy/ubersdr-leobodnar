@@ -34,26 +34,46 @@
 
 #include <time.h>
 
-//Leo LBE-142x defines, dont need anything external this time
+//Leo LBE-142x defines, don't need anything external this time
 #define VID_LBE		0x1dd2
 
 #define PID_LBE_1420	0x2443
-#define PID_LBE_1421	0xffff
+#define PID_LBE_1421	0x2444
 
 
-#define GPS_LOCK_BIT		0x01
-#define PLL_LOCK_BIT		0x02
+#define GPS_LOCK_BIT	0x01
+#define PLL_LOCK_BIT	0x02
 #define ANT_OK_BIT		0x04
 #define LED1_BIT		0x08
-#define OUT1_EN_BIT		0x10
-#define OUT2_EN_BIT		0x20
-#define PPS1_BIT		0x40
-//SetFeatureReportIDs
-#define LBE_1420_EN_OUT1	0x01
-#define LBE_1420_BLINK_OUT1	0x02
+#define LED2_BIT		0x10  // This is new for LBE-1421.
+#define OUT1_EN_BIT		0x20  // Changed from 0x10 to 0x20.
+#define OUT2_EN_BIT		0x40  // Changed from 0x20 to 0x40.
+#define PPS1_BIT		0x80  // Changed from 0x40 to 0x80.  Only supported on 1421?
+
+/* Common commands */
+#define LBE_142X_EN        0x01
+#define LBE_142X_BLINK	   0x02
+
+// LBE-1420 Specific Commands
 #define LBE_1420_SET_F1_NO_SAVE	0x03
-#define LBE_1420_SET_F1		0x04
-#define LBE_1420_SET_PWR1	0x07
+#define LBE_1420_SET_F1		    0x04
+#define LBE_1420_SET_PWR1	    0x07
+
+// LBE-1421 Specific Commands (These are all new)
+#define LBE_1421_SET_F1_NO_SAVE 0x05
+#define LBE_1421_SET_F1         0x06
+#define LBE_1421_SET_F2_NO_SAVE 0x09
+#define LBE_1421_SET_F2         0x0A
+#define LBE_142X_SET_PLL        0x0B
+#define LBE_1421_SET_PPS        0x0C
+#define LBE_1421_SET_PWR1       0x0D
+#define LBE_1421_SET_PWR2       0x0E
+
+#define LBE_1420_MAX_FREQ       1600000000UL
+#define LBE_1421_MAX_FREQ       1400000000UL
+#define LBE_REPORT_SIZE          60
+
+static uint16_t selected_pid = PID_LBE_1420; /* Default fallback */
 
 /*
  * Ugly hack to work around failing compilation on systems that don't
@@ -64,6 +84,146 @@
 #define HIDIOCSFEATURE(len)    _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
 #define HIDIOCGFEATURE(len)    _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, len)
 #endif
+
+/* The frequency payload is the only command whose layout differs between
+ * the two models: 1420 uses bytes 1..4, while 1421 uses bytes 5..8.  Keep
+ * that detail here so every caller (CLI and HTTP) emits the same report. */
+static int build_frequency_command(uint16_t pid, int output, int save,
+                                   uint32_t hz, uint8_t buf[LBE_REPORT_SIZE])
+{
+    uint8_t opcode;
+    size_t offset;
+    uint32_t max_freq;
+
+    memset(buf, 0, LBE_REPORT_SIZE);
+    if (pid == PID_LBE_1421) {
+        if (output == 1)
+            opcode = save ? LBE_1421_SET_F1 : LBE_1421_SET_F1_NO_SAVE;
+        else if (output == 2)
+            opcode = save ? LBE_1421_SET_F2 : LBE_1421_SET_F2_NO_SAVE;
+        else
+            return -1;
+        offset = 5;
+        max_freq = LBE_1421_MAX_FREQ;
+    } else if (pid == PID_LBE_1420) {
+        if (output != 1)
+            return -1;
+        opcode = save ? LBE_1420_SET_F1 : LBE_1420_SET_F1_NO_SAVE;
+        offset = 1;
+        max_freq = LBE_1420_MAX_FREQ;
+    } else {
+        return -1;
+    }
+
+    if (hz == 0 || hz > max_freq)
+        return -1;
+
+    buf[0] = opcode;
+    buf[offset + 0] = (uint8_t)(hz >> 0);
+    buf[offset + 1] = (uint8_t)(hz >> 8);
+    buf[offset + 2] = (uint8_t)(hz >> 16);
+    buf[offset + 3] = (uint8_t)(hz >> 24);
+    return 0;
+}
+
+static int build_power_command(uint16_t pid, int output, int low,
+                               uint8_t buf[LBE_REPORT_SIZE])
+{
+    memset(buf, 0, LBE_REPORT_SIZE);
+    if (pid == PID_LBE_1421) {
+        if (output == 1)
+            buf[0] = LBE_1421_SET_PWR1;
+        else if (output == 2)
+            buf[0] = LBE_1421_SET_PWR2;
+        else
+            return -1;
+    } else if (pid == PID_LBE_1420 && output == 1) {
+        buf[0] = LBE_1420_SET_PWR1;
+    } else {
+        return -1;
+    }
+    buf[1] = low ? 0x01 : 0x00;
+    return 0;
+}
+
+static void build_outputs_enable_command(uint16_t pid, int enable,
+                                         uint8_t buf[LBE_REPORT_SIZE])
+{
+    memset(buf, 0, LBE_REPORT_SIZE);
+    buf[0] = LBE_142X_EN;
+    /* The 1421 command controls its two outputs together. */
+    buf[1] = enable ? (pid == PID_LBE_1421 ? 0x03 : 0x01) : 0x00;
+}
+
+static void build_pll_command(int fll_mode, uint8_t buf[LBE_REPORT_SIZE])
+{
+    memset(buf, 0, LBE_REPORT_SIZE);
+    buf[0] = LBE_142X_SET_PLL;
+    buf[1] = fll_mode ? 0x01 : 0x00;
+}
+
+static int build_pps_command(uint16_t pid, int enable,
+                             uint8_t buf[LBE_REPORT_SIZE])
+{
+    if (pid != PID_LBE_1421)
+        return -1;
+    memset(buf, 0, LBE_REPORT_SIZE);
+    buf[0] = LBE_1421_SET_PPS;
+    buf[1] = enable ? 0x01 : 0x00;
+    return 0;
+}
+
+typedef struct {
+    uint8_t status;
+    uint8_t fll;
+    uint8_t out1_low;
+    uint8_t out2_low;
+    uint32_t frequency1_hz;
+    uint32_t frequency2_hz;
+    int valid;
+} HidStatus;
+
+static void decode_hid_status(uint16_t pid, const uint8_t buf[LBE_REPORT_SIZE],
+                              HidStatus *status)
+{
+    memset(status, 0, sizeof(*status));
+    status->status = buf[1];
+    status->frequency1_hz = ((uint32_t)buf[9] << 24) |
+                            ((uint32_t)buf[8] << 16) |
+                            ((uint32_t)buf[7] << 8) |
+                            (uint32_t)buf[6];
+    status->fll = buf[18];
+    if (pid == PID_LBE_1421) {
+        status->frequency2_hz = ((uint32_t)buf[17] << 24) |
+                                ((uint32_t)buf[16] << 16) |
+                                ((uint32_t)buf[15] << 8) |
+                                (uint32_t)buf[14];
+        status->out1_low = buf[19];
+        status->out2_low = buf[20];
+    } else {
+        status->out1_low = buf[10];
+    }
+    status->valid = 1;
+}
+
+static int read_hid_status(const char *hidraw_path, uint16_t pid,
+                           HidStatus *status)
+{
+    uint8_t buf[LBE_REPORT_SIZE] = {0};
+    if (!hidraw_path || !hidraw_path[0])
+        return -1;
+
+    int fd = open(hidraw_path, O_RDWR | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+    buf[0] = 0x01;
+    int rc = ioctl(fd, HIDIOCGFEATURE(256), buf);
+    close(fd);
+    if (rc < 0 || buf[0] != 0x01)
+        return -1;
+    decode_hid_status(pid, buf, status);
+    return 0;
+}
 
 #define HIDIOCGRAWNAME(len)     _IOC(_IOC_READ, 'H', 0x04, len)
 
@@ -276,13 +436,18 @@ static int read_nmea(const char *port, NmeaInfo *info)
     }
     cfsetispeed(&tty, B9600);
     cfsetospeed(&tty, B9600);
+    cfmakeraw(&tty);
     tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-    tty.c_cflag |= CLOCAL | CREAD;
+    tty.c_cflag |= (CREAD | CLOCAL);
     tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
     tty.c_iflag  = IGNBRK;
     tty.c_lflag  = 0;
     tty.c_oflag  = 0;
+    tty.c_cflag &= ~HUPCL;
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 0;
     tcsetattr(sfd, TCSANOW, &tty);
+    tcflush(sfd, TCIFLUSH);
 
     /* Set back to non-blocking for the read loop (we use select) */
     fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
@@ -378,6 +543,7 @@ typedef struct {
     char hidraw_path[64];   /* e.g. /dev/hidraw0 */
     char serial_path[64];   /* e.g. /dev/ttyACM0, or "" if not found */
     char name[128];
+    uint16_t product;
 } LbeDevice;
 
 /*
@@ -388,6 +554,8 @@ typedef struct {
  */
 static void find_paired_serial(const char *hidraw_name, char *out, size_t outsz)
 {
+    if (outsz == 0)
+        return;
     out[0] = '\0';
 
     /*
@@ -403,36 +571,55 @@ static void find_paired_serial(const char *hidraw_name, char *out, size_t outsz)
     snprintf(usbdev_rel, sizeof(usbdev_rel),
              "/sys/class/hidraw/%s/device/../..", hidraw_name);
 
-    /* Resolve to absolute path */
-    char usbdev[1024];
-    if (realpath(usbdev_rel, usbdev) == NULL) return;
+    /* Resolve to an absolute path.  Passing a fixed buffer smaller than
+     * PATH_MAX makes glibc's fortified realpath abort at runtime. */
+    char *usbdev = realpath(usbdev_rel, NULL);
+    if (!usbdev) return;
 
     /* Scan the USB device directory for interface dirs containing tty/ */
     DIR *d = opendir(usbdev);
-    if (!d) return;
+    if (!d) {
+        free(usbdev);
+        return;
+    }
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
 
-        char ttydir[1536];
-        snprintf(ttydir, sizeof(ttydir), "%s/%s/tty", usbdev, ent->d_name);
+        size_t ttydir_len = strlen(usbdev) + 1 + strlen(ent->d_name) +
+                            sizeof("/tty");
+        char *ttydir = malloc(ttydir_len);
+        if (!ttydir) continue;
+        snprintf(ttydir, ttydir_len, "%s/%s/tty", usbdev, ent->d_name);
 
         DIR *td = opendir(ttydir);
-        if (!td) continue;
+        if (!td) {
+            free(ttydir);
+            continue;
+        }
 
         struct dirent *tent;
         while ((tent = readdir(td)) != NULL) {
             if (tent->d_name[0] == '.') continue;
             /* Found a tty entry, e.g. "ttyACM0" */
-            snprintf(out, outsz, "/dev/%s", tent->d_name);
+            const size_t prefix_len = sizeof("/dev/") - 1;
+            if (outsz <= prefix_len) continue;
+            size_t name_len = strnlen(tent->d_name, outsz - prefix_len);
+            if (name_len == outsz - prefix_len) continue;
+            memcpy(out, "/dev/", prefix_len);
+            memcpy(out + prefix_len, tent->d_name, name_len + 1);
             closedir(td);
+            free(ttydir);
             closedir(d);
+            free(usbdev);
             return;
         }
         closedir(td);
+        free(ttydir);
     }
     closedir(d);
+    free(usbdev);
 }
 
 /*
@@ -458,6 +645,9 @@ static int find_lbe_devices(LbeDevice *devs, int maxdevs)
 
         if (info.vendor == VID_LBE &&
             (info.product == PID_LBE_1420 || info.product == PID_LBE_1421)) {
+
+            memset(&devs[count], 0, sizeof(devs[count]));
+            devs[count].product = info.product;
 
             strncpy(devs[count].hidraw_path, path, sizeof(devs[count].hidraw_path) - 1);
 
@@ -487,7 +677,7 @@ static int find_lbe_devices(LbeDevice *devs, int maxdevs)
 #define HTTP_DEFAULT_PORT 5123
 
 /* Global read-only flag — set once at startup, never modified afterwards.
- * When non-zero, all HID config writes and HTTP POST /config/* endpoints
+ * When non-zero, all HID config writes and HTTP configuration endpoints
  * are blocked. */
 static int g_readonly = 0;
 
@@ -500,12 +690,9 @@ typedef struct {
     char serial_port[64];
     int  serial_changed;   /* set by monitor, cleared by NMEA thread */
 
-    /* HID state — updated by NMEA thread on each $GNGGA (1Hz) */
-    uint8_t  hid_status;
-    uint8_t  hid_fll;
-    uint8_t  hid_out1low;
-    uint32_t frequency_hz;
-    int      hid_valid;
+    /* HID state — updated by the NMEA and heartbeat threads. */
+    uint16_t  pid;
+    HidStatus hid;
 
     /* NMEA state (updated continuously from serial streaming thread) */
     NmeaInfo nmea;
@@ -521,9 +708,12 @@ static void *device_monitor_thread(void *arg)
         int ndevs = find_lbe_devices(devs, MAX_DEVICES);
         pthread_mutex_lock(&st->lock);
         if (ndevs > 0) {
-            if (strcmp(st->hidraw_path, devs[0].hidraw_path) != 0)
+            if (strcmp(st->hidraw_path, devs[0].hidraw_path) != 0) {
                 strncpy(st->hidraw_path, devs[0].hidraw_path,
                         sizeof(st->hidraw_path) - 1);
+                st->hid.valid = 0;
+            }
+            st->pid = devs[0].product;
             if (strcmp(st->serial_port, devs[0].serial_path) != 0) {
                 strncpy(st->serial_port, devs[0].serial_path,
                         sizeof(st->serial_port) - 1);
@@ -534,6 +724,8 @@ static void *device_monitor_thread(void *arg)
         } else if (st->hidraw_path[0]) {
             st->hidraw_path[0] = '\0';
             st->serial_port[0] = '\0';
+            st->pid = 0;
+            st->hid.valid = 0;
             st->serial_changed = 1;
             memset(&st->nmea, 0, sizeof(st->nmea));
             st->nmea_valid = 0;
@@ -584,17 +776,26 @@ retry:;
     if (flags >= 0) fcntl(sfd, F_SETFL, flags & ~O_NONBLOCK);
 
     struct termios tty;
-    if (tcgetattr(sfd, &tty) == 0) {
-        cfsetispeed(&tty, B9600);
-        cfsetospeed(&tty, B9600);
-        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-        tty.c_cflag |= CLOCAL | CREAD;
-        tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
-        tty.c_iflag  = IGNBRK;
-        tty.c_lflag  = 0;
-        tty.c_oflag  = 0;
-        tcsetattr(sfd, TCSANOW, &tty);
+    if (tcgetattr(sfd, &tty) != 0) {
+        perror("    tcgetattr");
+        close(sfd);
+        return NULL;
     }
+    cfsetispeed(&tty, B9600);
+    cfsetospeed(&tty, B9600);
+    cfmakeraw(&tty);
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_cflag |= (CREAD | CLOCAL);
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
+    tty.c_iflag  = IGNBRK;
+    tty.c_lflag  = 0;
+    tty.c_oflag  = 0;
+    tty.c_cflag &= ~HUPCL;
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 0;
+    tcsetattr(sfd, TCSANOW, &tty);
+    tcflush(sfd, TCIFLUSH);
+
     if (flags >= 0) fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
 
     char linebuf[NMEA_LINE_MAX];
@@ -645,42 +846,19 @@ retry:;
                     parse_gga(linebuf, &st->nmea);
                     st->nmea_valid = 1;
                     char hid_snap[64];
+                    uint16_t pid_snap;
                     strncpy(hid_snap, st->hidraw_path, sizeof(hid_snap) - 1);
                     hid_snap[sizeof(hid_snap)-1] = '\0';
+                    pid_snap = st->pid;
                     pthread_mutex_unlock(&st->lock);
 
                     /* Read HID outside the lock — no blocking with mutex held */
-                    uint8_t  h_status = 0, h_fll = 0, h_out1low = 0;
-                    uint32_t h_freq   = 0;
-                    int      h_valid  = 0;
-                    if (hid_snap[0]) {
-                        int hfd = open(hid_snap, O_RDWR | O_NONBLOCK);
-                        if (hfd >= 0) {
-                            u_int8_t hbuf[60];
-                            hbuf[0] = 0x1;  /* Report 0x01: status + frequency */
-                            int hres = ioctl(hfd, HIDIOCGFEATURE(256), hbuf);
-                            if (hres >= 0 && hbuf[0] == 0x01) {
-                                h_status  = hbuf[1];
-                                h_fll     = hbuf[18];
-                                h_out1low = hbuf[10]; /* out1_power_low at byte 10 */
-                                /* frequency is at bytes 6-9 little-endian */
-                                h_freq    = ((uint32_t)hbuf[9] << 24) |
-                                            ((uint32_t)hbuf[8] << 16) |
-                                            ((uint32_t)hbuf[7] <<  8) |
-                                             (uint32_t)hbuf[6];
-                                h_valid   = 1;
-                            }
-                            close(hfd);
-                        }
-                    }
+                    HidStatus hid = {0};
+                    (void)read_hid_status(hid_snap, pid_snap, &hid);
 
                     /* Re-lock, store HID results, broadcast to SSE clients */
                     pthread_mutex_lock(&st->lock);
-                    st->hid_status   = h_status;
-                    st->hid_fll      = h_fll;
-                    st->hid_out1low  = h_out1low;
-                    st->frequency_hz = h_freq;
-                    st->hid_valid    = h_valid;
+                    st->hid = hid;
                     pthread_cond_broadcast(&st->new_data);
                     pthread_mutex_unlock(&st->lock);
                 } else {
@@ -741,16 +919,13 @@ static char *state_to_json(ServerState *st, int *device_present)
     hidraw_snap[sizeof(hidraw_snap)-1] = '\0';
     strncpy(serial_snap, st->serial_port, sizeof(serial_snap) - 1);
     serial_snap[sizeof(serial_snap)-1] = '\0';
-    uint8_t  hid_status  = st->hid_status;
-    uint8_t  hid_fll     = st->hid_fll;
-    uint8_t  hid_out1low = st->hid_out1low;
-    uint32_t freq        = st->frequency_hz;
-    int      hid_valid   = st->hid_valid;
+    uint16_t  pid        = st->pid;
+    HidStatus hid        = st->hid;
     NmeaInfo nmea        = st->nmea;
     int      nmea_valid  = st->nmea_valid;
     pthread_mutex_unlock(&st->lock);
 
-    *device_present = hid_valid;
+    *device_present = hid.valid;
 
     size_t cap = 4096;
     char *out = malloc(cap);
@@ -775,17 +950,27 @@ static char *state_to_json(ServerState *st, int *device_present)
         JCAT("  \"serial\": \"%s\",\n", serial_snap);
     else
         JCAT("  \"serial\": null,\n");
+    if (pid == PID_LBE_1421)
+        JCAT("  \"model\": \"LBE-1421\",\n");
+    else if (pid == PID_LBE_1420)
+        JCAT("  \"model\": \"LBE-1420\",\n");
+    else
+        JCAT("  \"model\": null,\n");
 
-    if (hid_valid) {
+    if (hid.valid) {
         JCAT("  \"device_status\": {\n");
-        JCAT("    \"gps_lock\":        %s,\n", (hid_status & GPS_LOCK_BIT) ? "true" : "false");
-        JCAT("    \"pll_lock\":        %s,\n", (hid_status & PLL_LOCK_BIT) ? "true" : "false");
-        JCAT("    \"antenna_ok\":      %s,\n", (hid_status & ANT_OK_BIT)   ? "true" : "false");
-        JCAT("    \"mode\":            \"%s\",\n", hid_fll ? "FLL" : "PLL");
-        JCAT("    \"output1_enabled\": %s,\n", (hid_status & OUT1_EN_BIT) ? "true" : "false");
-        JCAT("    \"output1_pps\":     %s,\n", (hid_status & PPS1_BIT)    ? "true" : "false");
-        JCAT("    \"output1_drive\":   \"%s\",\n", hid_out1low ? "low" : "normal");
-        JCAT("    \"frequency_hz\":    %u\n",  freq);
+        JCAT("    \"gps_lock\":        %s,\n", (hid.status & GPS_LOCK_BIT) ? "true" : "false");
+        JCAT("    \"pll_lock\":        %s,\n", (hid.status & PLL_LOCK_BIT) ? "true" : "false");
+        JCAT("    \"antenna_ok\":      %s,\n", (hid.status & ANT_OK_BIT)   ? "true" : "false");
+        JCAT("    \"mode\":            \"%s\",\n", hid.fll ? "FLL" : "PLL");
+        JCAT("    \"output1_enabled\": %s,\n", (hid.status & OUT1_EN_BIT) ? "true" : "false");
+        JCAT("    \"output1_pps\":     %s,\n", (pid == PID_LBE_1421 && (hid.status & PPS1_BIT)) ? "true" : "false");
+        JCAT("    \"output1_drive\":   \"%s\",\n", hid.out1_low ? "low" : "normal");
+        JCAT("    \"frequency_hz\":    %u,\n", hid.frequency1_hz);
+        JCAT("    \"frequency1_hz\":   %u,\n", hid.frequency1_hz);
+        JCAT("    \"output2_enabled\": %s,\n", (pid == PID_LBE_1421 && (hid.status & OUT2_EN_BIT)) ? "true" : "false");
+        JCAT("    \"output2_drive\":   \"%s\",\n", hid.out2_low ? "low" : "normal");
+        JCAT("    \"frequency2_hz\":   %u\n", hid.frequency2_hz);
         JCAT("  }");
     } else {
         JCAT("  \"device_status\": null");
@@ -873,7 +1058,7 @@ static int json_get_bool(const char *body, const char *key, int *val)
  * Returns 0 on success, -1 on open failure, -2 on ioctl failure.
  * On failure, errbuf (size errbuf_sz) is filled with a description. */
 static int hid_write_op(const char *hidraw_path,
-                        uint8_t buf[60],
+                        uint8_t buf[LBE_REPORT_SIZE],
                         char *errbuf, size_t errbuf_sz)
 {
     if (!hidraw_path || !hidraw_path[0]) {
@@ -885,11 +1070,31 @@ static int hid_write_op(const char *hidraw_path,
         snprintf(errbuf, errbuf_sz, "open %s: %s", hidraw_path, strerror(errno));
         return -1;
     }
-    int res = ioctl(fd, HIDIOCSFEATURE(60), buf);
+    int res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
     close(fd);
     if (res < 0) {
         snprintf(errbuf, errbuf_sz, "ioctl: %s", strerror(errno));
         return -2;
+    }
+    return 0;
+}
+
+/* Write a complete HTTP response segment. write(2) may complete only part
+ * of a buffer, and checking the result avoids ignored-result warnings. */
+static int write_all(int fd, const void *data, size_t len)
+{
+    const char *p = data;
+    while (len > 0) {
+        ssize_t written = write(fd, p, len);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (written == 0)
+            return -1;
+        p += written;
+        len -= (size_t)written;
     }
     return 0;
 }
@@ -922,8 +1127,8 @@ static void send_api_response(int cfd, int http_ok, int ok, const char *msg)
         "Connection: close\r\n"
         "\r\n",
         status, blen);
-    write(cfd, header, hlen);
-    write(cfd, body, blen);
+    if (hlen > 0 && write_all(cfd, header, (size_t)hlen) == 0)
+        (void)write_all(cfd, body, (size_t)blen);
 }
 
 /* ---- SSE client thread: streams JSON events on each $GNGGA ----------- */
@@ -1007,50 +1212,40 @@ static void *heartbeat_thread(void *arg)
 
         /* Snapshot HID path under lock */
         char hid_snap[64] = {0};
+        uint16_t pid_snap = 0;
         pthread_mutex_lock(&st->lock);
         strncpy(hid_snap, st->hidraw_path, sizeof(hid_snap) - 1);
+        pid_snap = st->pid;
         pthread_mutex_unlock(&st->lock);
 
         /* Read HID outside the lock */
-        uint8_t  h_status = 0, h_fll = 0, h_out1low = 0;
-        uint32_t h_freq   = 0;
-        int      h_valid  = 0;
-        if (hid_snap[0]) {
-            int hfd = open(hid_snap, O_RDWR | O_NONBLOCK);
-            if (hfd >= 0) {
-                u_int8_t hbuf[60];
-                hbuf[0] = 0x1;
-                int hres = ioctl(hfd, HIDIOCGFEATURE(256), hbuf);
-                if (hres >= 0 && hbuf[0] == 0x01) {
-                    h_status  = hbuf[1];
-                    h_fll     = hbuf[18];
-                    h_out1low = hbuf[10];
-                    h_freq    = ((uint32_t)hbuf[9] << 24) |
-                                ((uint32_t)hbuf[8] << 16) |
-                                ((uint32_t)hbuf[7] <<  8) |
-                                 (uint32_t)hbuf[6];
-                    h_valid   = 1;
-                }
-                close(hfd);
-            }
-        }
+        HidStatus hid = {0};
+        (void)read_hid_status(hid_snap, pid_snap, &hid);
 
         /* Store results and broadcast to SSE clients */
         pthread_mutex_lock(&st->lock);
-        if (h_valid) {
-            st->hid_status   = h_status;
-            st->hid_fll      = h_fll;
-            st->hid_out1low  = h_out1low;
-            st->frequency_hz = h_freq;
-            st->hid_valid    = h_valid;
+        if (hid.valid) {
+            st->hid = hid;
         } else if (hid_snap[0]) {
             /* Device was present but read failed — mark invalid */
-            st->hid_valid = 0;
+            st->hid.valid = 0;
         }
         pthread_cond_broadcast(&st->new_data);
         pthread_mutex_unlock(&st->lock);
     }
     return NULL;
+}
+
+/* Match exactly one request path.  A prefix-only match would make
+ * /config/frequency2 accidentally invoke the legacy /config/frequency
+ * handler. */
+static int request_path_is(const char *request, size_t offset,
+                           const char *path)
+{
+    size_t path_len = strlen(path);
+    return strncmp(request + offset, path, path_len) == 0 &&
+           (request[offset + path_len] == ' ' ||
+            request[offset + path_len] == '?');
 }
 
 static void serve_http(int port, int readonly)
@@ -1097,28 +1292,32 @@ static void serve_http(int port, int readonly)
     fprintf(stderr, "  GET  /events             -> SSE stream\n");
     if (!readonly) {
         fprintf(stderr, "  POST /config/frequency   -> {\"frequency_hz\":N[,\"save\":true]}\n");
+        fprintf(stderr, "  POST /config/frequency2  -> {\"frequency_hz\":N[,\"save\":true]} (1421)\n");
         fprintf(stderr, "  POST /config/output1     -> {\"enabled\":true|false}\n");
         fprintf(stderr, "  POST /config/power1      -> {\"low\":true|false}\n");
+        fprintf(stderr, "  POST /config/power2      -> {\"low\":true|false} (1421)\n");
+        fprintf(stderr, "  POST /config/pll         -> {\"fll\":true|false}\n");
+        fprintf(stderr, "  POST /config/pps         -> {\"enabled\":true|false} (1421)\n");
         fprintf(stderr, "  POST /config/blink       -> {}\n");
     } else {
         fprintf(stderr, "  POST /config/*           -> 403 Forbidden (read-only mode)\n");
     }
 
+    /* HTML Variables */
+    const char *model_name = "LBE-142x";
+
     /* Embedded HTML dashboard template.
-     * snprintf substitutions (7 total, in order):
+     * snprintf substitutions (4 total, in order):
+     *   %s  → Model name
+     *   %s  → Model name
      *   %s  → "true" or "false"  (READONLY JS variable)
-     *   %s  → prefix             (/config/output1)
-     *   %s  → prefix             (/config/frequency — setFreqVal)
-     *   %s  → prefix             (/config/frequency — setFreq)
-     *   %s  → prefix             (/config/power1)
-     *   %s  → prefix             (/config/blink)
-     *   %s  → prefix             (/events EventSource)
+     *   %s  → prefix             (all HTTP paths)
      * prefix comes from X-Forwarded-Prefix header (e.g. "/gpsdo"), default "".
      */
     static const char html_template[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>Leo Bodnar LBE-1420</title>"
+"<title>Leo Bodnar %s</title>"
 "<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"/>"
 "<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>"
 "<style>"
@@ -1144,13 +1343,15 @@ static void serve_http(int port, int readonly)
 "select:focus{outline:none;border-color:#4299e1;box-shadow:0 0 0 2px rgba(66,153,225,.2)}"
 "#ctrl_status{color:#718096;font-size:.8em;margin-top:.5em}"
 "#readonly_banner{background:#fffbeb;color:#92400e;border:1px solid #fcd34d;border-radius:4px;padding:.4em .7em;font-size:.8em;margin-bottom:.6em;display:none}"
+".dual{display:none}"
 "</style></head><body>"
-"<h1>&#x1F4E1; Leo Bodnar LBE-1420</h1>"
+"<h1>&#x1F4E1; Leo Bodnar %s</h1>"
 "<div id=\"readonly_banner\">&#x1F512; Read-only mode &mdash; configuration changes are disabled</div>"
 "<div id=\"status\">Connecting...</div>"
 "<div class=\"card\">"
 "  <div class=\"label\">Device</div>"
 "  <div class=\"grid\">"
+"    <div><div class=\"label\">Model</div><div class=\"val\" id=\"model\">-</div></div>"
 "    <div><div class=\"label\">HID path</div><div class=\"val\" id=\"device\">-</div></div>"
 "    <div><div class=\"label\">Serial</div><div class=\"val\" id=\"serial\">-</div></div>"
 "    <div><div class=\"label\">GPS lock</div><div class=\"val\" id=\"gps_lock\">-</div></div>"
@@ -1158,8 +1359,11 @@ static void serve_http(int port, int readonly)
 "    <div><div class=\"label\">Antenna</div><div class=\"val\" id=\"antenna\">-</div></div>"
 "    <div><div class=\"label\">Mode</div><div class=\"val\" id=\"mode\">-</div></div>"
 "    <div><div class=\"label\">Output 1</div><div class=\"val\" id=\"out1\">-</div></div>"
-"    <div><div class=\"label\">Drive</div><div class=\"val\" id=\"drive\">-</div></div>"
-"    <div><div class=\"label\">Frequency</div><div class=\"val\" id=\"freq\">-</div></div>"
+"    <div><div class=\"label\">Output 1 drive</div><div class=\"val\" id=\"drive1\">-</div></div>"
+"    <div><div class=\"label\">Output 1 frequency</div><div class=\"val\" id=\"freq1\">-</div></div>"
+"    <div class=\"dual\"><div class=\"label\">Output 2</div><div class=\"val\" id=\"out2\">-</div></div>"
+"    <div class=\"dual\"><div class=\"label\">Output 2 drive</div><div class=\"val\" id=\"drive2\">-</div></div>"
+"    <div class=\"dual\"><div class=\"label\">Output 2 frequency</div><div class=\"val\" id=\"freq2\">-</div></div>"
 "  </div>"
 "</div>"
 "<div class=\"card\">"
@@ -1182,33 +1386,62 @@ static void serve_http(int port, int readonly)
 "<div class=\"card\" id=\"ctrl_card\">"
 "  <div class=\"label\">Controls</div>"
 "  <div class=\"ctrl-row\">"
-"    <label>Output 1</label>"
+"    <label>Output(s)</label>"
 "    <input type=\"checkbox\" id=\"ctrl_out1\" onchange=\"setOutput1(this.checked)\">"
 "    <span class=\"val\" id=\"ctrl_out1_lbl\">-</span>"
 "  </div>"
 "  <div class=\"ctrl-row\">"
-"    <label>Frequency (Hz)</label>"
-"    <input type=\"number\" id=\"ctrl_freq\" min=\"1\" max=\"800000000\" step=\"1\" placeholder=\"Hz\" oninput=\"this.value=this.value.replace(/[^0-9]/g,'')\">"
-"    <button onclick=\"setFreq()\">Set</button>"
-"    <button onclick=\"setFreqVal(27000000)\">27 MHz</button>"
-"    <input type=\"checkbox\" id=\"ctrl_save\" checked>"
+"    <label>Output 1 Frequency (Hz)</label>"
+"    <input type=\"number\" id=\"ctrl_freq1\" min=\"1\" max=\"1600000000\" step=\"1\" placeholder=\"Hz\" oninput=\"this.value=this.value.replace(/[^0-9]/g,'')\">"
+"    <button onclick=\"setFreq1()\">Set</button>"
+"    <button onclick=\"setFreq1Val(27000000)\">27 MHz</button>"
+"    <input type=\"checkbox\" id=\"ctrl_save1\" checked>"
 "    <span class=\"label\">save to flash</span>"
 "  </div>"
 "  <div class=\"ctrl-row\">"
-"    <label>Output 1 drive</label>"
+"    <label>Output 1 Drive</label>"
 "    <select id=\"ctrl_pwr1\" onchange=\"setPower1(this.value==='low')\">"
 "      <option value=\"normal\">Normal</option>"
 "      <option value=\"low\">Low power</option>"
 "    </select>"
 "  </div>"
 "  <div class=\"ctrl-row\">"
+"    <label>Discipline mode</label>"
+"    <select id=\"ctrl_mode\" onchange=\"setPllMode(this.value==='fll')\">"
+"      <option value=\"pll\">PLL</option>"
+"      <option value=\"fll\">FLL</option>"
+"    </select>"
+"  </div>"
+"  <div id=\"dual_controls\" style=\"display:none\">"
+"    <div class=\"ctrl-row\">"
+"      <label>Output 2 Frequency (Hz)</label>"
+"      <input type=\"number\" id=\"ctrl_freq2\" min=\"1\" max=\"1400000000\" step=\"1\" placeholder=\"Hz\" oninput=\"this.value=this.value.replace(/[^0-9]/g,'')\">"
+"      <button onclick=\"setFreq2()\">Set</button>"
+"      <button onclick=\"setFreq2Val(27000000)\">27 MHz</button>"
+"      <input type=\"checkbox\" id=\"ctrl_save2\" checked>"
+"      <span class=\"label\">save to flash</span>"
+"    </div>"
+"    <div class=\"ctrl-row\">"
+"      <label>Output 2 Drive</label>"
+"      <select id=\"ctrl_pwr2\" onchange=\"setPower2(this.value==='low')\">"
+"        <option value=\"normal\">Normal</option>"
+"        <option value=\"low\">Low power</option>"
+"      </select>"
+"    </div>"
+"    <div class=\"ctrl-row\">"
+"      <label>1-PPS on output 1</label>"
+"      <input type=\"checkbox\" id=\"ctrl_pps\" onchange=\"setPps(this.checked)\">"
+"    </div>"
+"  </div>"
+"  <div class=\"ctrl-row\">"
 "    <label>LED</label>"
-"    <button onclick=\"doBlink()\">Blink output 1</button>"
+"    <button onclick=\"doBlink()\">Blink LED(s)</button>"
 "  </div>"
 "  <div id=\"ctrl_status\"></div>"
 "</div>"
 "<script>"
 "var READONLY=%s;"  /* substituted: "true" or "false" */
+"var PREFIX='%s';"
 "var evtCount=0,map=null,marker=null;"
 "function fmtFreq(hz){"
 "  if(hz>=1e6) return (hz/1e6).toFixed(6)+' MHz';"
@@ -1247,8 +1480,13 @@ static void serve_http(int port, int readonly)
 "  }"
 "}"
 "function update(d){"
+"  set('model', d.model||'-');"
 "  set('device', d.device||'none');"
 "  set('serial', d.serial||'none');"
+"  var dual=d.model==='LBE-1421';"
+"  Array.prototype.forEach.call(document.querySelectorAll('.dual'),function(e){e.style.display=dual?'block':'none';});"
+"  var dualControls=document.getElementById('dual_controls');"
+"  if(dualControls)dualControls.style.display=dual?'block':'none';"
 "  var s=d.device_status;"
 "  if(s){"
 "    set('gps_lock', s.gps_lock?'LOCKED':'NO LOCK', s.gps_lock?'ok':'err');"
@@ -1257,24 +1495,39 @@ static void serve_http(int port, int readonly)
 "    set('mode',     s.mode);"
 "    var o1=s.output1_enabled?(s.output1_pps?'enabled (1-PPS)':'enabled'):'disabled';"
 "    set('out1', o1, s.output1_enabled?'ok':'warn');"
-"    set('drive',    s.output1_drive);"
-"    set('freq',     fmtFreq(s.frequency_hz));"
+"    set('drive1',   s.output1_drive);"
+"    set('freq1',    fmtFreq(s.frequency1_hz));"
+"    if(dual){"
+"      set('out2',s.output2_enabled?'enabled':'disabled',s.output2_enabled?'ok':'warn');"
+"      set('drive2',s.output2_drive);"
+"      set('freq2',fmtFreq(s.frequency2_hz));"
+"    }"
 "    /* Sync controls from live state (only if user isn't actively editing) */"
 "    var cb=document.getElementById('ctrl_out1');"
 "    if(cb&&document.activeElement!==cb){"
 "      cb.checked=s.output1_enabled;"
 "      document.getElementById('ctrl_out1_lbl').textContent=s.output1_enabled?'enabled':'disabled';"
 "    }"
-"    var fi=document.getElementById('ctrl_freq');"
+"    var fi=document.getElementById('ctrl_freq1');"
 "    if(fi&&document.activeElement!==fi){"
-"      fi.value=s.frequency_hz;"
+"      fi.value=s.frequency1_hz;"
 "    }"
 "    var pw=document.getElementById('ctrl_pwr1');"
 "    if(pw&&document.activeElement!==pw){"
 "      pw.value=(s.output1_drive==='low')?'low':'normal';"
 "    }"
+"    var mode=document.getElementById('ctrl_mode');"
+"    if(mode&&document.activeElement!==mode)mode.value=(s.mode||'PLL').toLowerCase();"
+"    if(dual){"
+"      var f2=document.getElementById('ctrl_freq2');"
+"      if(f2&&document.activeElement!==f2)f2.value=s.frequency2_hz;"
+"      var p2=document.getElementById('ctrl_pwr2');"
+"      if(p2&&document.activeElement!==p2)p2.value=(s.output2_drive==='low')?'low':'normal';"
+"      var pps=document.getElementById('ctrl_pps');"
+"      if(pps&&document.activeElement!==pps)pps.checked=s.output1_pps;"
+"    }"
 "  } else {"
-"    ['gps_lock','pll_lock','antenna','mode','out1','drive','freq'].forEach(function(i){set(i,'-');});"
+"    ['gps_lock','pll_lock','antenna','mode','out1','drive1','freq1','out2','drive2','freq2'].forEach(function(i){set(i,'-');});"
 "  }"
 "  var g=d.gps;"
 "  if(g){"
@@ -1311,26 +1564,46 @@ static void serve_http(int port, int readonly)
 "}"
 "function setOutput1(enabled){"
 "  document.getElementById('ctrl_out1_lbl').textContent=enabled?'enabled':'disabled';"
-"  apiPost('%s/config/output1',{enabled:enabled});"  /* PREFIX */
+"  apiPost(PREFIX+'/config/output1',{enabled:enabled});"
 "}"
-"function setFreqVal(hz){"
-"  document.getElementById('ctrl_freq').value=hz;"
-"  var save=document.getElementById('ctrl_save').checked;"
-"  apiPost('%s/config/frequency',{frequency_hz:hz,save:save});"  /* PREFIX */
+"function setFreq1Val(hz){"
+"  document.getElementById('ctrl_freq1').value=hz;"
+"  var save=document.getElementById('ctrl_save1').checked;"
+"  apiPost(PREFIX+'/config/frequency',{frequency_hz:hz,save:save});"
 "}"
-"function setFreq(){"
-"  var hz=parseInt(document.getElementById('ctrl_freq').value,10);"
+"function setFreq1(){"
+"  var hz=parseInt(document.getElementById('ctrl_freq1').value,10);"
 "  if(!hz||hz<1){document.getElementById('ctrl_status').textContent='Enter a valid frequency in Hz';return;}"
-"  var save=document.getElementById('ctrl_save').checked;"
-"  apiPost('%s/config/frequency',{frequency_hz:hz,save:save});"  /* PREFIX */
+"  var save=document.getElementById('ctrl_save1').checked;"
+"  apiPost(PREFIX+'/config/frequency',{frequency_hz:hz,save:save});"
+"}"
+"function setFreq2Val(hz){"
+"  document.getElementById('ctrl_freq2').value=hz;"
+"  var save=document.getElementById('ctrl_save2').checked;"
+"  apiPost(PREFIX+'/config/frequency2',{frequency_hz:hz,save:save});"
+"}"
+"function setFreq2(){"
+"  var hz=parseInt(document.getElementById('ctrl_freq2').value,10);"
+"  if(!hz||hz<1){document.getElementById('ctrl_status').textContent='Enter a valid frequency in Hz';return;}"
+"  var save=document.getElementById('ctrl_save2').checked;"
+"  apiPost(PREFIX+'/config/frequency2',{frequency_hz:hz,save:save});"
 "}"
 "function setPower1(low){"
-"  apiPost('%s/config/power1',{low:low});"  /* PREFIX */
+"  apiPost(PREFIX+'/config/power1',{low:low});"
+"}"
+"function setPower2(low){"
+"  apiPost(PREFIX+'/config/power2',{low:low});"
+"}"
+"function setPllMode(fll){"
+"  apiPost(PREFIX+'/config/pll',{fll:fll});"
+"}"
+"function setPps(enabled){"
+"  apiPost(PREFIX+'/config/pps',{enabled:enabled});"
 "}"
 "function doBlink(){"
-"  apiPost('%s/config/blink',{});"  /* PREFIX */
+"  apiPost(PREFIX+'/config/blink',{});"
 "}"
-"var es=new EventSource('%s/events');"  /* PREFIX */
+"var es=new EventSource(PREFIX+'/events');"
 "es.onopen=function(){document.getElementById('status').textContent='Connected - live updates via SSE';};"
 "es.onerror=function(){document.getElementById('status').textContent='SSE disconnected - retrying...';};"
 "es.onmessage=function(e){"
@@ -1385,12 +1658,16 @@ static void serve_http(int port, int readonly)
         /* Determine method and path */
         int is_get  = (strncmp(req, "GET ",  4) == 0);
         int is_post = (strncmp(req, "POST ", 5) == 0);
-        int is_sse  = is_get  && (strncmp(req + 4, "/events", 7) == 0);
-        int is_json = is_get  && (strncmp(req + 4, "/json",   5) == 0);
-        int is_post_freq  = is_post && (strncmp(req + 5, "/config/frequency", 17) == 0);
-        int is_post_out1  = is_post && (strncmp(req + 5, "/config/output1",   15) == 0);
-        int is_post_pwr1  = is_post && (strncmp(req + 5, "/config/power1",    14) == 0);
-        int is_post_blink = is_post && (strncmp(req + 5, "/config/blink",     13) == 0);
+        int is_sse  = is_get  && request_path_is(req, 4, "/events");
+        int is_json = is_get  && request_path_is(req, 4, "/json");
+        int is_post_freq  = is_post && request_path_is(req, 5, "/config/frequency");
+        int is_post_freq2 = is_post && request_path_is(req, 5, "/config/frequency2");
+        int is_post_out1  = is_post && request_path_is(req, 5, "/config/output1");
+        int is_post_pwr1  = is_post && request_path_is(req, 5, "/config/power1");
+        int is_post_pwr2  = is_post && request_path_is(req, 5, "/config/power2");
+        int is_post_pll   = is_post && request_path_is(req, 5, "/config/pll");
+        int is_post_pps   = is_post && request_path_is(req, 5, "/config/pps");
+        int is_post_blink = is_post && request_path_is(req, 5, "/config/blink");
 
         if (is_sse) {
             /* Hand off to a dedicated SSE thread (keeps connection open) */
@@ -1428,11 +1705,13 @@ static void serve_http(int port, int readonly)
                 "Connection: close\r\n"
                 "\r\n",
                 status_line, body_len);
-            write(cfd, header, hlen);
-            write(cfd, body, body_len);
+            if (hlen > 0 && write_all(cfd, header, (size_t)hlen) == 0)
+                (void)write_all(cfd, body, body_len);
             if (json) free(json);
             close(cfd);
-        } else if (is_post_freq || is_post_out1 || is_post_pwr1 || is_post_blink) {
+        } else if (is_post_freq || is_post_freq2 || is_post_out1 ||
+                   is_post_pwr1 || is_post_pwr2 || is_post_pll ||
+                   is_post_pps || is_post_blink) {
             /* --- Config POST endpoints ---------------------------------- */
 
             /* Reject writes in read-only mode */
@@ -1447,8 +1726,8 @@ static void serve_http(int port, int readonly)
                     "Connection: close\r\n"
                     "\r\n",
                     sizeof(ro_body) - 1);
-                write(cfd, ro_hdr, rhl);
-                write(cfd, ro_body, sizeof(ro_body) - 1);
+                if (rhl > 0 && write_all(cfd, ro_hdr, (size_t)rhl) == 0)
+                    (void)write_all(cfd, ro_body, sizeof(ro_body) - 1);
                 close(cfd);
                 continue;
             }
@@ -1460,18 +1739,21 @@ static void serve_http(int port, int readonly)
 
             /* Snapshot HID path under lock */
             char hid_snap[64] = {0};
+            uint16_t pid_snap = 0;
             pthread_mutex_lock(&st.lock);
             strncpy(hid_snap, st.hidraw_path, sizeof(hid_snap) - 1);
+            pid_snap = st.pid;
             pthread_mutex_unlock(&st.lock);
 
-            uint8_t hbuf[60];
+            uint8_t hbuf[LBE_REPORT_SIZE];
             memset(hbuf, 0, sizeof(hbuf));
             char errbuf[128] = {0};
             int rc;
 
-            if (is_post_freq) {
+            if (is_post_freq || is_post_freq2) {
                 long freq_hz = 0;
-                if (!json_get_long(body_start, "frequency_hz", &freq_hz) || freq_hz <= 0) {
+                if (!json_get_long(body_start, "frequency_hz", &freq_hz) ||
+                    freq_hz <= 0 || (unsigned long)freq_hz > UINT32_MAX) {
                     send_api_response(cfd, 0, 0, "missing or invalid frequency_hz");
                     close(cfd); continue;
                 }
@@ -1480,11 +1762,13 @@ static void serve_http(int port, int readonly)
                 if (json_get_bool(body_start, "save", &save_val))
                     save_flag = save_val;
 
-                hbuf[0] = save_flag ? LBE_1420_SET_F1 : LBE_1420_SET_F1_NO_SAVE;
-                hbuf[1] = (freq_hz >>  0) & 0xff;
-                hbuf[2] = (freq_hz >>  8) & 0xff;
-                hbuf[3] = (freq_hz >> 16) & 0xff;
-                hbuf[4] = (freq_hz >> 24) & 0xff;
+                if (build_frequency_command(pid_snap, is_post_freq2 ? 2 : 1,
+                                            save_flag, (uint32_t)freq_hz, hbuf) < 0) {
+                    send_api_response(cfd, 0, 0,
+                        is_post_freq2 ? "frequency2 is unsupported or out of range" :
+                                        "frequency is out of range");
+                    close(cfd); continue;
+                }
                 rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
 
             } else if (is_post_out1) {
@@ -1493,22 +1777,47 @@ static void serve_http(int port, int readonly)
                     send_api_response(cfd, 0, 0, "missing or invalid enabled");
                     close(cfd); continue;
                 }
-                hbuf[0] = LBE_1420_EN_OUT1;
-                hbuf[1] = enabled & 0x01;
+                build_outputs_enable_command(pid_snap, enabled, hbuf);
                 rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
 
-            } else if (is_post_pwr1) {
+            } else if (is_post_pwr1 || is_post_pwr2) {
                 int low = -1;
                 if (!json_get_bool(body_start, "low", &low)) {
                     send_api_response(cfd, 0, 0, "missing or invalid low");
                     close(cfd); continue;
                 }
-                hbuf[0] = LBE_1420_SET_PWR1;
-                hbuf[1] = low ? 0x01 : 0x00;
+                if (build_power_command(pid_snap, is_post_pwr2 ? 2 : 1,
+                                        low, hbuf) < 0) {
+                    send_api_response(cfd, 0, 0,
+                        "power2 is only supported by LBE-1421");
+                    close(cfd); continue;
+                }
+                rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
+
+            } else if (is_post_pll) {
+                int fll = -1;
+                if (!json_get_bool(body_start, "fll", &fll)) {
+                    send_api_response(cfd, 0, 0, "missing or invalid fll");
+                    close(cfd); continue;
+                }
+                build_pll_command(fll, hbuf);
+                rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
+
+            } else if (is_post_pps) {
+                int enabled = -1;
+                if (!json_get_bool(body_start, "enabled", &enabled)) {
+                    send_api_response(cfd, 0, 0, "missing or invalid enabled");
+                    close(cfd); continue;
+                }
+                if (build_pps_command(pid_snap, enabled, hbuf) < 0) {
+                    send_api_response(cfd, 0, 0,
+                        "1PPS control is only supported by LBE-1421");
+                    close(cfd); continue;
+                }
                 rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
 
             } else {  /* is_post_blink */
-                hbuf[0] = LBE_1420_BLINK_OUT1;
+                hbuf[0] = LBE_142X_BLINK;
                 rc = hid_write_op(hid_snap, hbuf, errbuf, sizeof(errbuf));
             }
 
@@ -1540,15 +1849,13 @@ static void serve_http(int port, int readonly)
             /* Compute body length first (snprintf returns the would-be length) */
             const char *ro_str = readonly ? "true" : "false";
             int body_len = snprintf(NULL, 0, html_template,
-                ro_str,
-                prefix, prefix, prefix, prefix, prefix, prefix);
+                model_name, model_name, ro_str, prefix);
             if (body_len < 0) { close(cfd); continue; }
 
             char *body = malloc((size_t)body_len + 1);
             if (!body) { close(cfd); continue; }
             snprintf(body, (size_t)body_len + 1, html_template,
-                ro_str,
-                prefix, prefix, prefix, prefix, prefix, prefix);
+                model_name, model_name, ro_str, prefix);
 
             char header[128];
             int hlen = snprintf(header, sizeof(header),
@@ -1558,8 +1865,8 @@ static void serve_http(int port, int readonly)
                 "Connection: close\r\n"
                 "\r\n",
                 body_len);
-            write(cfd, header, hlen);
-            write(cfd, body, (size_t)body_len);
+            if (hlen > 0 && write_all(cfd, header, (size_t)hlen) == 0)
+                (void)write_all(cfd, body, (size_t)body_len);
             free(body);
             close(cfd);
         }
@@ -1567,7 +1874,11 @@ static void serve_http(int port, int readonly)
     close(srv);
 }
 
-int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port, int *readonly);
+int processCommandLineArguments(int argc, char **argv,
+                                int *freq1, int *freq2, int *blink, int *enable,
+                                int *save1, int *save2, int *power1, int *power2,
+                                int *fll_mode, int *pps, char **serial_port,
+                                int *json_out, int *serve, int *port, int *readonly);
 
 int main(int argc, char **argv)
 {
@@ -1616,6 +1927,7 @@ int main(int argc, char **argv)
       int res;
       u_int8_t buf[60];
       uint32_t current_f = 0;
+      uint32_t current_f2 = 0;
 
       struct hidraw_devinfo info;
 
@@ -1652,7 +1964,7 @@ int main(int argc, char **argv)
                   printf("        --f1:  frequency in Hz (1 to 1100000000), saved to flash\n");
                   printf(" --f1_nosave:  frequency in Hz, not saved\n");
                   printf("      --out1:  [0,1]  enable/disable output\n");
-                  printf("     --blink1  blink output 1 LED for 3 seconds\n");
+                  printf("     --blink1  blink output LED(s) for 3 seconds\n");
                   printf("    --serial:  serial port for NMEA GPS data\n\n");
                   return 1;
               }
@@ -1669,6 +1981,7 @@ int main(int argc, char **argv)
                   strncpy(auto_serial_buf, devs[0].serial_path, sizeof(auto_serial_buf) - 1);
                   auto_serial = auto_serial_buf;
               }
+              selected_pid = devs[0].product;
           } else {
               if (json_mode) {
                   /* In JSON mode, just pick the first device */
@@ -1678,6 +1991,7 @@ int main(int argc, char **argv)
                       strncpy(auto_serial_buf, devs[0].serial_path, sizeof(auto_serial_buf) - 1);
                       auto_serial = auto_serial_buf;
                   }
+                  selected_pid = devs[0].product;
               } else {
                   printf("Multiple Leo Bodnar devices found:\n");
                   for (int i = 0; i < ndevs; i++)
@@ -1698,6 +2012,7 @@ int main(int argc, char **argv)
                       strncpy(auto_serial_buf, devs[choice].serial_path, sizeof(auto_serial_buf) - 1);
                       auto_serial = auto_serial_buf;
                   }
+                  selected_pid = devs[choice].product;
                   printf("\n");
               }
           }
@@ -1743,6 +2058,7 @@ int main(int argc, char **argv)
                 }
                 return -1;
             }
+            selected_pid = info.product;
       }
 
       /* Get Raw Name */
@@ -1764,18 +2080,11 @@ int main(int argc, char **argv)
       }
 
       /* Collect HID status fields */
-      uint8_t hid_status  = 0;
-      uint8_t hid_fll     = 0;
-      uint8_t hid_out1low = 0;
-      int     hid_valid   = 0;
+      HidStatus hid = {0};
       if (res >= 0 && buf[0] == 0x01) {
-          hid_status  = buf[1];
-          hid_fll     = buf[18];
-          hid_out1low = buf[10]; /* out1_power_low at byte 10 */
-          /* frequency is at bytes 6-9 little-endian */
-          current_f   = ((uint32_t)buf[9] << 24) | ((uint32_t)buf[8] << 16) |
-                        ((uint32_t)buf[7] <<  8) |  (uint32_t)buf[6];
-          hid_valid   = 1;
+          decode_hid_status(selected_pid, buf, &hid);
+          current_f = hid.frequency1_hz;
+          current_f2 = hid.frequency2_hz;
       }
 
       /* Get Raw Name (reuse buf for CLI parsing below) */
@@ -1789,13 +2098,22 @@ int main(int argc, char **argv)
  //Get CLI values as vars
  int blink = -1;
  int enable = -1;
- int save = -1;
+ int save1 = -1;
+ int save2 = -1;
  int new_f = 0xffffffff;
+ int new_f2 = 0xffffffff;
+ int power1 = -1;
+ int power2 = -1;
+ int fll_mode = -1;
+ int pps = -1;
  int json_out_unused = 0; /* already captured in json_mode */
  int serve_unused = 0, port_unused = 0; /* already captured in pre-scan */
  int readonly_unused = 0; /* already captured in readonly_mode */
  char *serial_port = NULL;
- processCommandLineArguments(argc, argv, &new_f, &blink, &enable, &save, &serial_port, &json_out_unused, &serve_unused, &port_unused, &readonly_unused);
+ processCommandLineArguments(argc, argv, &new_f, &new_f2, &blink, &enable,
+                             &save1, &save2, &power1, &power2, &fll_mode, &pps,
+                             &serial_port, &json_out_unused, &serve_unused,
+                             &port_unused, &readonly_unused);
 
  /* Apply environment variable fallbacks for any option not set by CLI args.
   * CLI args always take priority over env vars. */
@@ -1806,16 +2124,35 @@ int main(int argc, char **argv)
      if (new_f == (int)0xffffffff) {
          if ((ev = getenv("LBE_F1")) != NULL && atoi(ev) > 0) {
              new_f = atoi(ev);
-             save  = 1;
+             save1 = 1;
          } else if ((ev = getenv("LBE_F1_NOSAVE")) != NULL && atoi(ev) > 0) {
              new_f = atoi(ev);
-             save  = 0;
+             save1 = 0;
+         }
+     }
+     if (new_f2 == (int)0xffffffff) {
+         if ((ev = getenv("LBE_F2")) != NULL && atoi(ev) > 0) {
+             new_f2 = atoi(ev);
+             save2 = 1;
+         } else if ((ev = getenv("LBE_F2_NOSAVE")) != NULL && atoi(ev) > 0) {
+             new_f2 = atoi(ev);
+             save2 = 0;
          }
      }
      if (enable == -1 && (ev = getenv("LBE_OUT1")) != NULL)
          enable = atoi(ev);
      if (blink == -1 && (ev = getenv("LBE_BLINK1")) != NULL && atoi(ev))
          blink = 1;
+     if (power1 == -1 && (ev = getenv("LBE_PWR1")) != NULL)
+         power1 = atoi(ev);
+     if (power2 == -1 && (ev = getenv("LBE_PWR2")) != NULL)
+         power2 = atoi(ev);
+     if (fll_mode == -1 && (ev = getenv("LBE_FLL")) != NULL && atoi(ev))
+         fll_mode = 1;
+     if (fll_mode == -1 && (ev = getenv("LBE_PLL")) != NULL && atoi(ev))
+         fll_mode = 0;
+     if (pps == -1 && (ev = getenv("LBE_PPS")) != NULL)
+         pps = atoi(ev);
  }
 
  /* Fall back to auto-detected serial port if --serial not given */
@@ -1834,18 +2171,24 @@ int main(int argc, char **argv)
      /* ---- JSON output ---- */
      printf("{\n");
      printf("  \"device\": \"%s\",\n", hidraw_path);
+     printf("  \"model\": \"%s\",\n",
+            selected_pid == PID_LBE_1421 ? "LBE-1421" : "LBE-1420");
      if (serial_port)
          printf("  \"serial\": \"%s\",\n", serial_port);
-     if (hid_valid) {
+     if (hid.valid) {
          printf("  \"device_status\": {\n");
-         printf("    \"gps_lock\":   %s,\n",  (hid_status & GPS_LOCK_BIT) ? "true" : "false");
-         printf("    \"pll_lock\":   %s,\n",  (hid_status & PLL_LOCK_BIT) ? "true" : "false");
-         printf("    \"antenna_ok\": %s,\n",  (hid_status & ANT_OK_BIT)   ? "true" : "false");
-         printf("    \"mode\":       \"%s\",\n", hid_fll ? "FLL" : "PLL");
-         printf("    \"output1_enabled\": %s,\n", (hid_status & OUT1_EN_BIT) ? "true" : "false");
-         printf("    \"output1_pps\":     %s,\n", (hid_status & PPS1_BIT)    ? "true" : "false");
-         printf("    \"output1_drive\":   \"%s\",\n", hid_out1low ? "low" : "normal");
-         printf("    \"frequency_hz\":    %u\n", current_f);
+         printf("    \"gps_lock\":        %s,\n",  (hid.status & GPS_LOCK_BIT) ? "true" : "false");
+         printf("    \"pll_lock\":        %s,\n",  (hid.status & PLL_LOCK_BIT) ? "true" : "false");
+         printf("    \"antenna_ok\":      %s,\n",  (hid.status & ANT_OK_BIT)   ? "true" : "false");
+         printf("    \"mode\":            \"%s\",\n", hid.fll ? "FLL" : "PLL");
+         printf("    \"output1_enabled\": %s,\n", (hid.status & OUT1_EN_BIT) ? "true" : "false");
+         printf("    \"output1_pps\":     %s,\n", (selected_pid == PID_LBE_1421 && (hid.status & PPS1_BIT)) ? "true" : "false");
+         printf("    \"output1_drive\":   \"%s\",\n", hid.out1_low ? "low" : "normal");
+         printf("    \"frequency_hz\":    %u,\n", current_f);
+         printf("    \"frequency1_hz\":   %u,\n", current_f);
+         printf("    \"output2_enabled\": %s,\n", (selected_pid == PID_LBE_1421 && (hid.status & OUT2_EN_BIT)) ? "true" : "false");
+         printf("    \"output2_drive\":   \"%s\",\n", hid.out2_low ? "low" : "normal");
+         printf("    \"frequency2_hz\":   %u\n", current_f2);
          printf("  }");
      } else {
          printf("  \"device_status\": null");
@@ -1888,17 +2231,22 @@ int main(int argc, char **argv)
      printf("\n}\n");
  } else {
      /* ---- Human-readable output ---- */
-     if (hid_valid) {
+     if (hid.valid) {
          printf("  Device Status:\n");
-         printf("    GPS lock:   %s\n", (hid_status & GPS_LOCK_BIT) ? "LOCKED"        : "NO LOCK");
-         printf("    PLL lock:   %s\n", (hid_status & PLL_LOCK_BIT) ? "LOCKED"        : "unlocked");
-         printf("    Antenna:    %s\n", (hid_status & ANT_OK_BIT)   ? "OK"            : "SHORT CIRCUIT");
-         printf("    Mode:       %s\n", hid_fll                     ? "FLL"           : "PLL");
-         printf("    Output 1:   %s",  (hid_status & OUT1_EN_BIT)   ? "enabled"       : "disabled");
-         if (hid_status & PPS1_BIT) printf("  (1-PPS mode)");
+         printf("    GPS lock:   %s\n", (hid.status & GPS_LOCK_BIT) ? "LOCKED"        : "NO LOCK");
+         printf("    PLL lock:   %s\n", (hid.status & PLL_LOCK_BIT) ? "LOCKED"        : "unlocked");
+         printf("    Antenna:    %s\n", (hid.status & ANT_OK_BIT)   ? "OK"            : "SHORT CIRCUIT");
+         printf("    Mode:       %s\n", hid.fll                     ? "FLL"           : "PLL");
+         printf("    Output 1:   %s",  (hid.status & OUT1_EN_BIT)   ? "enabled"       : "disabled");
+         if (selected_pid == PID_LBE_1421 && (hid.status & PPS1_BIT)) printf("  (1-PPS mode)");
          printf("\n");
-         printf("    Out1 drive: %s\n", hid_out1low ? "low" : "normal");
-         printf("    Frequency:  %u Hz\n", current_f);
+         printf("    Out1 drive: %s\n", hid.out1_low ? "low" : "normal");
+         printf("    Frequency 1: %u Hz\n", current_f);
+         if (selected_pid == PID_LBE_1421) {
+             printf("    Output 2:   %s\n", (hid.status & OUT2_EN_BIT) ? "enabled" : "disabled");
+             printf("    Out2 drive: %s\n", hid.out2_low ? "low" : "normal");
+             printf("    Frequency 2: %u Hz\n", current_f2);
+         }
          printf("\n");
      }
      if (serial_port) {
@@ -1950,46 +2298,100 @@ int main(int argc, char **argv)
      }
  }
 
- if (!json_mode) {
-     printf("  Changes:\n");
+ if (selected_pid != PID_LBE_1421 &&
+     (new_f2 != (int)0xffffffff || power2 != -1 || pps != -1)) {
+     fprintf(stderr, "Output 2 and 1PPS controls require an LBE-1421.\n");
+     close(fd);
+     return 2;
  }
-       	int changed = 0;
+ if ((enable != -1 && enable != 0 && enable != 1) ||
+     (power1 != -1 && power1 != 0 && power1 != 1) ||
+     (power2 != -1 && power2 != 0 && power2 != 1) ||
+     (pps != -1 && pps != 0 && pps != 1)) {
+     fprintf(stderr, "Boolean options must be 0 or 1.\n");
+     close(fd);
+     return 2;
+ }
+
+ if (!json_mode)
+     printf("  Changes:\n");
+ int changed = 0;
  if (readonly_mode) {
      if (!json_mode) printf("    Read-only mode — no changes applied\n");
  } else {
- if (new_f != 0xffffffff && new_f != current_f) {
-     if (!json_mode) printf("    Setting Frequency: %d Hz\n", new_f);
-
-     memset(buf, 0, sizeof(buf));
-     buf[0] = (save == 1 ? LBE_1420_SET_F1 : LBE_1420_SET_F1_NO_SAVE);
-     buf[1] = (new_f >>  0) & 0xff;
-     buf[2] = (new_f >>  8) & 0xff;
-     buf[3] = (new_f >> 16) & 0xff;
-     buf[4] = (new_f >> 24) & 0xff;
-     res = ioctl(fd, HIDIOCSFEATURE(60), buf);
-     if (res < 0) perror("HIDIOCSFEATURE");
-     changed = 1;
- }
- if (enable != -1) {
-     memset(buf, 0, sizeof(buf));
-     buf[0] = LBE_1420_EN_OUT1;
-     buf[1] = enable & 0x01;
-     if (!json_mode) printf("    Output 1 enable: %d\n", enable);
-     res = ioctl(fd, HIDIOCSFEATURE(60), buf);
-     if (res < 0) perror("HIDIOCSFEATURE");
-     changed = 1;
- }
- if (blink != -1) {
-     memset(buf, 0, sizeof(buf));
-     buf[0] = LBE_1420_BLINK_OUT1;
-     if (!json_mode) printf("    Blink LED\n");
-     res = ioctl(fd, HIDIOCSFEATURE(60), buf);
-     if (res < 0) perror("HIDIOCSFEATURE");
-     changed = 1;
- }
- if (!changed && !json_mode) {
-     printf("    No changes made\n");
- }
+     if (new_f != (int)0xffffffff && (uint32_t)new_f != current_f) {
+         if (build_frequency_command(selected_pid, 1, save1, (uint32_t)new_f,
+                                     buf) < 0) {
+             fprintf(stderr, "Output 1 frequency must be between 1 and %lu Hz.\n",
+                     (unsigned long)(selected_pid == PID_LBE_1421 ? LBE_1421_MAX_FREQ : LBE_1420_MAX_FREQ));
+         } else {
+             if (!json_mode) printf("    Setting output 1 frequency: %d Hz\n", new_f);
+             res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+             if (res < 0) perror("HIDIOCSFEATURE");
+             else changed = 1;
+         }
+     }
+     if (new_f2 != (int)0xffffffff && (uint32_t)new_f2 != current_f2) {
+         if (build_frequency_command(selected_pid, 2, save2, (uint32_t)new_f2,
+                                     buf) < 0) {
+             fprintf(stderr, "Output 2 frequency must be between 1 and %lu Hz.\n",
+                     (unsigned long)LBE_1421_MAX_FREQ);
+         } else {
+             if (!json_mode) printf("    Setting output 2 frequency: %d Hz\n", new_f2);
+             res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+             if (res < 0) perror("HIDIOCSFEATURE");
+             else changed = 1;
+         }
+     }
+     if (enable != -1) {
+         build_outputs_enable_command(selected_pid, enable, buf);
+         if (!json_mode) printf("    Output%s enable: %d\n",
+                                selected_pid == PID_LBE_1421 ? "s" : " 1", enable);
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (power1 != -1) {
+         (void)build_power_command(selected_pid, 1, power1, buf);
+         if (!json_mode) printf("    Setting output 1 drive: %s\n",
+                                power1 ? "low" : "normal");
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (power2 != -1) {
+         (void)build_power_command(selected_pid, 2, power2, buf);
+         if (!json_mode) printf("    Setting output 2 drive: %s\n",
+                                power2 ? "low" : "normal");
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (fll_mode != -1) {
+         build_pll_command(fll_mode, buf);
+         if (!json_mode) printf("    Setting discipline mode: %s\n",
+                                fll_mode ? "FLL" : "PLL");
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (pps != -1) {
+         (void)build_pps_command(selected_pid, pps, buf);
+         if (!json_mode) printf("    1-PPS on output 1: %s\n", pps ? "enabled" : "disabled");
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (blink != -1) {
+         memset(buf, 0, sizeof(buf));
+         buf[0] = LBE_142X_BLINK;
+         if (!json_mode) printf("    Blink LED(s)\n");
+         res = ioctl(fd, HIDIOCSFEATURE(LBE_REPORT_SIZE), buf);
+         if (res < 0) perror("HIDIOCSFEATURE");
+         else changed = 1;
+     }
+     if (!changed && !json_mode)
+         printf("    No changes made\n");
  } /* end !readonly_mode */
 
  /* Start web server if requested (blocks forever) */
@@ -2003,7 +2405,11 @@ int main(int argc, char **argv)
 }
 
 
-int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, int *enable, int *save, char **serial_port, int *json_out, int *serve, int *port, int *readonly)
+int processCommandLineArguments(int argc, char **argv,
+                                int *freq1, int *freq2, int *blink, int *enable,
+                                int *save1, int *save2, int *power1, int *power2,
+                                int *fll_mode, int *pps, char **serial_port,
+                                int *json_out, int *serve, int *port, int *readonly)
 {
     int c;
     
@@ -2018,6 +2424,15 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
                 {"f1",        required_argument, 0, 'a'},
                 {"f1_nosave", required_argument, 0, 'b'},
                 {"out1",      required_argument, 0, 'c'},
+                {"f2",        required_argument, 0, 'd'},
+                {"f2_nosave", required_argument, 0, 'e'},
+                {"fll",       no_argument,       0, 'f'},
+                {"pll",       no_argument,       0, 'l'},
+                {"pps",       required_argument, 0, 'q'},
+                {"power1",    required_argument, 0, 'm'},
+                {"pwr1",      required_argument, 0, 'm'},
+                {"power2",    required_argument, 0, 'n'},
+                {"pwr2",      required_argument, 0, 'n'},
                 {"serial",    required_argument, 0, 's'},
                 {"json",      no_argument,       0, 'j'},
                 {"serve",     no_argument,       0, 'S'},
@@ -2028,7 +2443,7 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
         /* getopt_long stores the option index here. */
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "abc:s:jSP:R",
+        c = getopt_long(argc, argv, "a:b:c:d:e:flq:m:n:s:jSP:R",
                     long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -2038,24 +2453,54 @@ int processCommandLineArguments(int argc, char **argv, int *freq, int *blink, in
         switch (c)
         {
             case 0:
-            	*blink = 1;
+              *blink = 1;
                 /* If this option set a flag, do nothing else now. */
                 if (long_options[option_index].flag != 0)
                         break;
                 break;
             
             case 'a'://f1
-                *freq = atoi(optarg);
-                *save = 1;
+                *freq1 = atoi(optarg);
+                *save1 = 1;
                 break;
 
             case 'b'://f1_nosave
-                *freq = atoi(optarg);
-                *save = 0;
+                *freq1 = atoi(optarg);
+                *save1 = 0;
                 break;
 
             case 'c'://out1
                 *enable = atoi(optarg);
+                break;
+
+            case 'd'://f2
+                *freq2 = atoi(optarg);
+                *save2 = 1;
+                break;
+
+            case 'e'://f2_nosave
+                *freq2 = atoi(optarg);
+                *save2 = 0;
+                break;
+
+            case 'f'://fll
+                *fll_mode = 1;
+                break;
+
+            case 'l'://pll
+                *fll_mode = 0;
+                break;
+
+            case 'q'://pps
+                *pps = atoi(optarg);
+                break;
+
+            case 'm'://power1
+                *power1 = atoi(optarg);
+                break;
+
+            case 'n'://power2
+                *power2 = atoi(optarg);
                 break;
 
             case 's'://serial port

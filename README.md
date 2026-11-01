@@ -1,8 +1,9 @@
-# lbe-142x — Leo Bodnar LBE-1420 GPS-Locked Clock Source Utility
+# lbe-142x — Leo Bodnar LBE-1420/LBE-1421 GPS-Locked Clock Source Utility
 
 A Linux command-line utility and web dashboard for configuring and monitoring the
 [Leo Bodnar LBE-1420](http://www.leobodnar.com/shop/index.php?main_page=product_info&cPath=107&products_id=301)
-GPS-locked clock source via its USB HID interface.
+and [LBE-1421 Dual](https://www.leobodnar.com/shop/index.php?main_page=product_info&cPath=107&products_id=326)
+GPS-locked clock sources via their USB HID interface.
 
 ## Intended Use
 
@@ -65,9 +66,16 @@ If multiple devices are present you will be prompted to choose.
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `--f1` | `<Hz>` | Set output frequency in Hz (1–1,600,000,000). Saved to flash. |
-| `--f1_nosave` | `<Hz>` | Set output frequency in Hz. **Not** saved to flash (temporary). |
-| `--out1` | `0` or `1` | Disable (`0`) or enable (`1`) output 1. |
+| `--f1` | `<Hz>` | Set output 1 frequency in Hz. Saved to flash. On 1420: 1–1,600,000,000; on 1421: 1–1,400,000,000. |
+| `--f1_nosave` | `<Hz>` | Set output 1 frequency temporarily (not saved to flash). |
+| `--f2` | `<Hz>` | Set LBE-1421 output 2 frequency in Hz (1–1,400,000,000), saved to flash. |
+| `--f2_nosave` | `<Hz>` | Set LBE-1421 output 2 frequency temporarily. |
+| `--out1` | `0` or `1` | Disable or enable output 1. On 1421 this controls both outputs together. |
+| `--power1`, `--pwr1` | `0` or `1` | Set output 1 drive: normal (`0`) or low (`1`). |
+| `--power2`, `--pwr2` | `0` or `1` | Set LBE-1421 output 2 drive: normal (`0`) or low (`1`). |
+| `--pll` | — | Use PLL discipline mode. |
+| `--fll` | — | Use FLL discipline mode. |
+| `--pps` | `0` or `1` | Disable or enable 1-PPS on LBE-1421 output 1. |
 | `--blink1` | — | Blink the output 1 LED for ~3 seconds. |
 | `--serial` | `<port>` | Serial port for NMEA GPS data (e.g. `/dev/ttyACM0`). |
 | `--json` | — | Output a single JSON snapshot to stdout and exit. |
@@ -86,6 +94,12 @@ sudo ./lbe-142x --f1 27000000
 
 # Set frequency to 10 MHz, not saved
 sudo ./lbe-142x --f1_nosave 10000000
+
+# Configure both LBE-1421 outputs and enable its 1-PPS mode
+sudo ./lbe-142x --f1 27000000 --power1 0 --f2 10000000 --power2 1 --pps 1
+
+# Select PLL discipline mode (works on both models)
+sudo ./lbe-142x --pll
 
 # Enable output 1
 sudo ./lbe-142x --out1 1
@@ -117,7 +131,14 @@ take priority over environment variables.
 | `LBE_JSON` | `--json` | Set to `1` to enable JSON output mode. |
 | `LBE_F1` | `--f1` | Output frequency in Hz, saved to flash. |
 | `LBE_F1_NOSAVE` | `--f1_nosave` | Output frequency in Hz, **not** saved to flash. |
+| `LBE_F2` | `--f2` | LBE-1421 output 2 frequency in Hz, saved to flash. |
+| `LBE_F2_NOSAVE` | `--f2_nosave` | LBE-1421 output 2 frequency in Hz, not saved to flash. |
 | `LBE_OUT1` | `--out1` | `1` to enable output 1, `0` to disable. |
+| `LBE_PWR1` | `--power1` | Output 1 drive: `0` normal, `1` low. |
+| `LBE_PWR2` | `--power2` | LBE-1421 output 2 drive: `0` normal, `1` low. |
+| `LBE_PLL` | `--pll` | Set to `1` to select PLL discipline mode. |
+| `LBE_FLL` | `--fll` | Set to `1` to select FLL discipline mode. |
+| `LBE_PPS` | `--pps` | LBE-1421 1-PPS state: `0` disabled, `1` enabled. |
 | `LBE_BLINK1` | `--blink1` | Set to `1` to blink the output 1 LED. |
 | `LBE_READONLY` | `--readonly` | Set to `1` to enable read-only mode (no config writes). |
 

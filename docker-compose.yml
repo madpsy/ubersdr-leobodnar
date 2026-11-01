@@ -6,8 +6,8 @@ services:
     privileged: true
     volumes:
       - /dev:/dev
-    ports:
-      - "5123:5123"
+    # ports:
+    #   - "5123:5123"
     environment:
       # All CLI options can be set via environment variables.
       # CLI arguments always take priority over env vars.
@@ -32,3 +32,11 @@ services:
       # LBE_F1: "27000000"
       # LBE_OUT1: "1"
       # LBE_READONLY: "1"
+    networks:
+      - sdr-network
+
+networks:
+      sdr-network:
+        external: true
+        name: ubersdr_sdr-network
+
